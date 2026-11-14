@@ -1,18 +1,5 @@
 // WithoutAI — Clean Instagram-Style Social Media App
-// GitHub Cloud Database Sync (Cross-Device Photos/Videos) + Post Editing (Caption/Tag/Location/Media) + <10% AI Filter
-
-function detectDefaultGitHubRepo() {
-  const saved = localStorage.getItem('withoutai_gh_repo');
-  if (saved) return saved;
-  const host = window.location.hostname || '';
-  if (host.endsWith('.github.io')) {
-    const owner = host.replace('.github.io', '');
-    const pathParts = window.location.pathname.split('/').filter(Boolean);
-    const repo = pathParts[0] || '';
-    if (owner && repo) return `${owner}/${repo}`;
-  }
-  return '';
-}
+// Post Editing (Caption/Tag/Location/Media) + <10% AI Filter
 
 const state = {
   lang: localStorage.getItem('withoutai_lang') || 'tr',
@@ -24,7 +11,7 @@ const state = {
   exploreTheme: 'all',
   exploreQuery: '',
   activeDmUser: 'elif.ceramics',
-  modal: null, // null | { type: 'create' } | { type: 'editPost', postId } | { type: 'cloudSync' } | { type: 'report', postId } | { type: 'story', storyId } | { type: 'editProfile' } | { type: 'followers', listType, username }
+  modal: null, // null | { type: 'create' } | { type: 'editPost', postId } | { type: 'report', postId } | { type: 'story', storyId } | { type: 'editProfile' } | { type: 'followers', listType, username }
   scanStatus: 'idle', // 'idle' | 'scanning' | 'blocked'
   simMode: 'real', // 'real' (<10% AI -> passes) | 'ai_test' (>=10% AI -> auto-removed/blocked)
   blockedReport: null,
@@ -37,12 +24,6 @@ const state = {
 
   // Edit Post Draft State
   editPostDraft: null, // { postId, caption, theme, location, camera, newMedia: null }
-
-  // GitHub Cloud Database Config
-  ghRepo: detectDefaultGitHubRepo(), // e.g. 'username/WithoutAI'
-  ghBranch: localStorage.getItem('withoutai_gh_branch') || 'main',
-  ghToken: localStorage.getItem('withoutai_gh_token') || '',
-  syncInProgress: false,
 };
 
 const DB_NAME = 'withoutai_clean_db_v4';
@@ -82,81 +63,7 @@ async function deleteUserPostFromDB(postId) {
   }
 }
 
-// ==================== GITHUB CLOUD DATABASE SYNC (CROSS-DEVICE) ====================
-function blobToBase64(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      const dataUrl = reader.result || '';
-      const base64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
-      resolve(base64);
-    };
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
-}
-
-async function githubApiGetFile(repo, path, branch, token) {
-  const headers = { Accept: 'application/vnd.github.v3+json' };
-  if (token) headers.Authorization = `Bearer ${token}`;
-  const res = await fetch(
-    `https://api.github.com/repos/${repo}/contents/${path}?ref=${encodeURIComponent(branch)}&t=${Date.now()}`,
-    { headers, cache: 'no-store' }
-  );
-  if (!res.ok) return null;
-  return await res.json();
-}
-
-async function githubApiPutFile(repo, path, branch, token, base64Content, message, existingSha = null) {
-  const headers = {
-    Accept: 'application/vnd.github.v3+json',
-    Authorization: `Bearer ${token}`,
-    'Content-Type': 'application/json',
-  };
-  let sha = existingSha;
-  if (!sha) {
-    const existing = await githubApiGetFile(repo, path, branch, token);
-    if (existing && existing.sha) sha = existing.sha;
-  }
-  const body = {
-    message,
-    content: base64Content,
-    branch,
-  };
-  if (sha) body.sha = sha;
-
-  const res = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
-    method: 'PUT',
-    headers,
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const errData = await res.json().catch(() => ({}));
-    throw new Error(errData.message || `GitHub API Error (${res.status})`);
-  }
-  return await res.json();
-}
-
-// Load shared posts so ANY device (phone, tablet, other PC) sees uploaded photos & videos!
 async function loadSharedPostsFromCloud() {
-  const repo = state.ghRepo || detectDefaultGitHubRepo();
-  const branch = state.ghBranch || 'main';
-
-  // 1. Try reading live from GitHub API / Raw URL if repo is known or auto-detected from github.io
-  if (repo && repo.includes('/')) {
-    try {
-      const fileData = await githubApiGetFile(repo, 'shared-posts.json', branch, state.ghToken);
-      if (fileData && fileData.content) {
-        const jsonStr = decodeURIComponent(escape(atob(fileData.content.replace(/\s/g, ''))));
-        const parsed = JSON.parse(jsonStr);
-        if (Array.isArray(parsed)) return parsed;
-      }
-    } catch (e) {
-      console.warn('GitHub API read fallback:', e);
-    }
-  }
-
-  // 2. Also try reading relative ./shared-posts.json in the same hosted directory
   try {
     const res = await fetch(`./shared-posts.json?t=${Date.now()}`, { cache: 'no-store' });
     if (res.ok) {
@@ -164,114 +71,7 @@ async function loadSharedPostsFromCloud() {
       if (Array.isArray(parsed)) return parsed;
     }
   } catch (_) {}
-
   return [];
-}
-
-// Upload media file (if blob) to GitHub 'uploads/' folder and update 'shared-posts.json'
-async function syncAllUserPostsToGitHub(showFeedback = false) {
-  const repo = (state.ghRepo || '').trim();
-  const token = (state.ghToken || '').trim();
-  const branch = (state.ghBranch || 'main').trim() || 'main';
-
-  if (!repo || !token) {
-    if (showFeedback) {
-      openCloudSyncModal();
-    }
-    return false;
-  }
-
-  state.syncInProgress = true;
-  if (state.modal && state.modal.type === 'cloudSync') renderModal();
-
-  try {
-    // Collect all user-uploaded posts (id starting with 'p-') or edited k1 post
-    const customPosts = posts.filter((p) => p.username === 'kaan.doc' && (p.id.startsWith('p-') || p.isEdited));
-    const serializedPosts = [];
-
-    for (const p of customPosts) {
-      let remoteUrl = p.remoteMediaUrl || p.mediaUrl || '';
-
-      // If this post has a local Blob that hasn't been uploaded to GitHub yet, upload it to uploads/
-      if (p.blob instanceof Blob && (!remoteUrl || remoteUrl.startsWith('blob:'))) {
-        const ext = p.mediaType === 'video' ? 'mp4' : 'jpg';
-        const safeName = `${p.id}.${ext}`;
-        const repoPath = `uploads/${safeName}`;
-        const base64Data = await blobToBase64(p.blob);
-
-        await githubApiPutFile(
-          repo,
-          repoPath,
-          branch,
-          token,
-          base64Data,
-          `Upload media ${safeName} via WithoutAI`
-        );
-
-        remoteUrl = `https://raw.githubusercontent.com/${repo}/${branch}/${repoPath}`;
-        p.remoteMediaUrl = remoteUrl;
-        await saveUserPostToDB(p);
-      }
-
-      if (remoteUrl && !remoteUrl.startsWith('blob:')) {
-        serializedPosts.push({
-          id: p.id,
-          feedCategory: p.feedCategory || 'following',
-          username: 'kaan.doc',
-          fullName: p.fullName || 'Kaan',
-          isFounding: true,
-          location: p.location,
-          timeAgo: p.timeAgo,
-          timestamp: p.timestamp,
-          theme: p.theme,
-          score: p.score || 1,
-          badgeType: p.badgeType || 'low',
-          badgeLabel: p.badgeLabel,
-          camera: p.camera || 'C2PA Verified Media',
-          likes: p.likes || 1,
-          mediaType: p.mediaType,
-          mediaUrl: remoteUrl,
-          remoteMediaUrl: remoteUrl,
-          caption: p.caption,
-          comments: p.comments || [],
-          isEdited: Boolean(p.isEdited),
-        });
-      }
-    }
-
-    const jsonString = JSON.stringify(serializedPosts, null, 2);
-    const jsonBase64 = btoa(unescape(encodeURIComponent(jsonString)));
-
-    await githubApiPutFile(
-      repo,
-      'shared-posts.json',
-      branch,
-      token,
-      jsonBase64,
-      'Sync shared-posts.json via WithoutAI'
-    );
-
-    state.syncInProgress = false;
-    if (state.modal && state.modal.type === 'cloudSync') renderModal();
-
-    if (showFeedback) {
-      toast(
-        state.lang === 'tr'
-          ? '☁️ Tüm fotoğraf ve videoların GitHub depona eşitlendi! Artık her cihazda görünür.'
-          : '☁️ All your photos and videos are synced to GitHub! Visible on all devices.'
-      );
-    }
-    return true;
-  } catch (err) {
-    state.syncInProgress = false;
-    if (state.modal && state.modal.type === 'cloudSync') renderModal();
-    toast(
-      state.lang === 'tr'
-        ? `⚠️ GitHub Senkronizasyon Hatası: ${err.message}`
-        : `⚠️ GitHub Sync Error: ${err.message}`
-    );
-    return false;
-  }
 }
 
 // Kaan's Custom Uploaded Profile Photo (Embedded Base64 so it loads 100% instantly)
@@ -1474,38 +1274,6 @@ function openEditProfileModal() {
   renderModal();
 }
 
-function openCloudSyncModal() {
-  state.modal = { type: 'cloudSync' };
-  renderModal();
-}
-
-async function saveCloudSyncSettings() {
-  const repoEl = document.getElementById('gh-repo-input');
-  const branchEl = document.getElementById('gh-branch-input');
-  const tokenEl = document.getElementById('gh-token-input');
-
-  if (repoEl) {
-    let val = repoEl.value.trim();
-    val = val.replace(/^https?:\/\/github\.com\//i, '').replace(/\.git$/i, '').replace(/\/$/, '');
-    state.ghRepo = val;
-    localStorage.setItem('withoutai_gh_repo', val);
-  }
-  if (branchEl && branchEl.value.trim()) {
-    state.ghBranch = branchEl.value.trim();
-    localStorage.setItem('withoutai_gh_branch', state.ghBranch);
-  }
-  if (tokenEl) {
-    state.ghToken = tokenEl.value.trim();
-    localStorage.setItem('withoutai_gh_token', state.ghToken);
-  }
-
-  renderNavigation();
-  const ok = await syncAllUserPostsToGitHub(true);
-  if (ok) {
-    closeModal();
-  }
-}
-
 function handleProfileAvatarInput(e) {
   const file = e.target.files && e.target.files[0];
   if (!file) return;
@@ -1627,10 +1395,6 @@ async function saveEditedPost() {
   renderModal();
   renderMain();
   toast(tr('feed.updatedToast'));
-
-  if (state.ghRepo && state.ghToken) {
-    syncAllUserPostsToGitHub(false);
-  }
 }
 
 // ==================== POST ACTIONS (LIKE, DOUBLE-CLICK HEART, SAVE, COMMENT) ====================
@@ -1747,10 +1511,6 @@ async function deletePost(postId) {
   }
 
   toast(tr('feed.deletedToast'));
-
-  if (state.ghRepo && state.ghToken) {
-    syncAllUserPostsToGitHub(false);
-  }
 }
 
 // ONLY kaan.doc's own stories can be deleted!
@@ -1992,11 +1752,6 @@ async function scanAndPublishPost() {
         ? `✅ AI oranı %${scoreVal} (<%10) doğrulandı ve paylaşıldı!`
         : `✅ AI score ${scoreVal}% (<10%) verified and shared!`
     );
-
-    // If GitHub Cloud Sync is connected, automatically push the new photo/video to GitHub!
-    if (state.ghRepo && state.ghToken) {
-      syncAllUserPostsToGitHub(true);
-    }
   }, 600);
 }
 
@@ -2517,9 +2272,6 @@ function renderProfileView() {
               <button class="btn-outline" onclick="openEditProfileModal()">
                 ✏️ ${isTr ? 'Profili Düzenle' : 'Edit Profile'}
               </button>
-              <button class="btn-outline" onclick="openCloudSyncModal()">
-                ☁️ ${isTr ? 'GitHub Eşitle' : 'GitHub Sync'}
-              </button>
             `
                 : `
               <button class="profile-follow-btn ${profileData.isFollowedByMe ? 'following' : ''}" onclick="toggleFollowUser('${profileData.username}')">
@@ -2602,9 +2354,8 @@ function renderModal() {
 
   const isTr = state.lang === 'tr';
 
-  // 1. Clean Photo/Video Upload Modal with <10% AI Threshold & Cloud Sync Info
+  // 1. Clean Photo/Video Upload Modal with <10% AI Threshold
   if (state.modal.type === 'create') {
-    const isCloudConnected = Boolean(state.ghRepo && state.ghToken);
     modalRoot.innerHTML = `
       <div class="modal-overlay" onclick="closeModal()">
         <div class="modal-card" onclick="event.stopPropagation()">
@@ -2613,25 +2364,6 @@ function renderModal() {
             <button class="ig-icon-btn" style="font-size:1.1rem;" onclick="closeModal()">✕</button>
           </div>
           <div class="modal-body">
-            <!-- Cloud Sync Status Banner -->
-            <div class="cloud-sync-bar">
-              <span>
-                <span class="cloud-dot ${isCloudConnected ? 'online' : 'local'}"></span>
-                ${
-                  isCloudConnected
-                    ? isTr
-                      ? `<strong>GitHub Bulut Aktif:</strong> (${state.ghRepo}) Tüm cihazlarda görünür`
-                      : `<strong>GitHub Cloud Active:</strong> (${state.ghRepo}) Visible on all devices`
-                    : isTr
-                    ? 'Diğer cihazlarda da görünmesi için GitHub deponu bağla:'
-                    : 'Connect your GitHub repo so uploads appear on all devices:'
-                }
-              </span>
-              <button class="edit-post-btn" onclick="openCloudSyncModal()">
-                ☁️ ${isTr ? 'Ayarla' : 'Configure'}
-              </button>
-            </div>
-
             <p style="font-size:0.81rem; color:var(--text-muted); margin-bottom:0.8rem;">
               ${tr('createModal.sub')}
             </p>
@@ -2814,89 +2546,7 @@ function renderModal() {
     return;
   }
 
-  // 3. GitHub Cloud Database Sync Modal
-  if (state.modal.type === 'cloudSync') {
-    modalRoot.innerHTML = `
-      <div class="modal-overlay" onclick="closeModal()">
-        <div class="modal-card" style="max-width:500px;" onclick="event.stopPropagation()">
-          <div class="modal-top">
-            <span>☁️ ${isTr ? 'GitHub Bulut Veritabanı & Cihazlar Arası Eşitleme' : 'GitHub Cloud Database & Cross-Device Sync'}</span>
-            <button class="ig-icon-btn" style="font-size:1.1rem;" onclick="closeModal()">✕</button>
-          </div>
-          <div class="modal-body">
-            <p style="font-size:0.82rem; color:var(--text-muted); line-height:1.48; margin-bottom:0.9rem;">
-              ${
-                isTr
-                  ? 'Yüklediğin fotoğraf ve videoların sadece senin bilgisayarında değil, <strong>GitHub linkine giren tüm telefon ve bilgisayarlarda</strong> görünmesi için GitHub deponu buraya bağla. Yüklediğin medya dosyaları otomatik olarak depondaki <code>uploads/</code> klasörüne ve <code>shared-posts.json</code> dosyasına kaydedilir.'
-                  : 'Connect your GitHub repository so photos and videos you upload appear on <strong>every phone and computer</strong> visiting your GitHub link. Media files are automatically committed to <code>uploads/</code> and <code>shared-posts.json</code>.'
-              }
-            </p>
-
-            <div style="margin-bottom:0.8rem;">
-              <label style="font-size:0.8rem; font-weight:700; display:block; margin-bottom:0.25rem;">
-                ${isTr ? 'GitHub Depo Adı (kullaniciadi/repo-adi)' : 'GitHub Repository (username/repo-name)'}
-              </label>
-              <input
-                id="gh-repo-input"
-                type="text"
-                placeholder="Örn: kaan/WithoutAI"
-                value="${state.ghRepo}"
-                style="width:100%; padding:0.6rem; border-radius:8px; border:1px solid var(--border); background:var(--bg-body); color:var(--text-main); font-family:inherit;"
-              />
-            </div>
-
-            <div style="margin-bottom:0.8rem;">
-              <label style="font-size:0.8rem; font-weight:700; display:block; margin-bottom:0.25rem;">
-                ${isTr ? 'Dal (Branch)' : 'Branch'}
-              </label>
-              <input
-                id="gh-branch-input"
-                type="text"
-                placeholder="main"
-                value="${state.ghBranch}"
-                style="width:100%; padding:0.6rem; border-radius:8px; border:1px solid var(--border); background:var(--bg-body); color:var(--text-main); font-family:inherit;"
-              />
-            </div>
-
-            <div style="margin-bottom:1rem;">
-              <label style="font-size:0.8rem; font-weight:700; display:block; margin-bottom:0.25rem;">
-                ${isTr ? 'GitHub Personal Access Token (Yazma İzinli Token)' : 'GitHub Personal Access Token (with repo/contents write permission)'}
-              </label>
-              <input
-                id="gh-token-input"
-                type="password"
-                placeholder="ghp_xxxxxxxxxxxxxxxxxxxx"
-                value="${state.ghToken}"
-                style="width:100%; padding:0.6rem; border-radius:8px; border:1px solid var(--border); background:var(--bg-body); color:var(--text-main); font-family:inherit;"
-              />
-              <span style="font-size:0.72rem; color:var(--text-muted); display:block; margin-top:0.3rem;">
-                ${
-                  isTr
-                    ? '💡 GitHub -> Settings -> Developer settings -> Personal access tokens (Classic) -> Generate new token ("repo" kutucuğunu işaretle).'
-                    : '💡 GitHub -> Settings -> Developer settings -> Personal access tokens (Classic) -> Generate new token (check "repo" scope).'
-                }
-              </span>
-            </div>
-
-            <button class="btn-primary" style="width:100%;" onclick="saveCloudSyncSettings()">
-              ${
-                state.syncInProgress
-                  ? isTr
-                    ? '⏳ GitHub Depona Yükleniyor...'
-                    : '⏳ Uploading to GitHub Repo...'
-                  : isTr
-                  ? '☁️ Kaydet ve Yüklediğim Gönderileri GitHub’a Eşitle'
-                  : '☁️ Save & Sync My Uploaded Posts to GitHub'
-              }
-            </button>
-          </div>
-        </div>
-      </div>
-    `;
-    return;
-  }
-
-  // 4. Post Detail & AI Badge Report Modal
+  // 3. Post Detail & AI Badge Report Modal
   if (state.modal.type === 'report') {
     const post = posts.find((p) => p.id === state.modal.postId) || posts[0];
     if (!post) {
@@ -3127,7 +2777,6 @@ function renderNavigation() {
   const sidebar = document.getElementById('sidebar-root');
   const bottomnav = document.getElementById('bottomnav-root');
   const isMyProfileActive = state.page === 'profile' && state.profileUser === 'kaan.doc';
-  const isCloudConnected = Boolean(state.ghRepo && state.ghToken);
 
   if (topbar) {
     topbar.innerHTML = `
@@ -3135,9 +2784,6 @@ function renderNavigation() {
         WithoutAI<span class="ig-logo-dot">.</span>
       </div>
       <div class="mobile-top-actions">
-        <button class="mobile-pill-btn" onclick="openCloudSyncModal()">
-          <span class="cloud-dot ${isCloudConnected ? 'online' : 'local'}"></span>☁️
-        </button>
         <button class="mobile-pill-btn" onclick="setLang('${state.lang === 'tr' ? 'en' : 'tr'}')">
           ${state.lang === 'tr' ? '🇹🇷 TR' : '🇬🇧 EN'}
         </button>
@@ -3176,10 +2822,6 @@ function renderNavigation() {
           <button class="ig-nav-item ${isMyProfileActive ? 'active' : ''}" onclick="setPage('profile')">
             <span class="ig-nav-icon">👤</span>
             <span>${tr('nav.profile')}</span>
-          </button>
-          <button class="ig-nav-item" onclick="openCloudSyncModal()">
-            <span class="ig-nav-icon">☁️</span>
-            <span>${tr('nav.cloudSync')} <span class="cloud-dot ${isCloudConnected ? 'online' : 'local'}"></span></span>
           </button>
           <button class="ig-nav-item ig-nav-create" onclick="openCreateModal()">
             <span class="ig-nav-icon">➕</span>
