@@ -1,1 +1,36 @@
-[]
+[
+  {
+    "id": "p-1794669997451",
+    "feedCategory": "following",
+    "username": "kaan.doc",
+    "fullName": "Kaan",
+    "isFounding": true,
+    "location": {
+      "tr": "İstanbul",
+      "en": "İstanbul"
+    },
+    "timeAgo": {
+      "tr": "ŞİMDİ",
+      "en": "JUST NOW"
+    },
+    "timestamp": 1794669997451,
+    "theme": "#handmade",
+    "score": 2,
+    "badgeType": "low",
+    "badgeLabel": {
+      "tr": "AI-filtered · %2",
+      "en": "AI-filtered · 2%"
+    },
+    "camera": "C2PA Verified Media",
+    "likes": 1,
+    "mediaType": "video",
+    "mediaUrl": "https://raw.githubusercontent.com/Kaan-Koc/WithoutAI/main/uploads/p-1794669997451.mp4",
+    "remoteMediaUrl": "https://raw.githubusercontent.com/Kaan-Koc/WithoutAI/main/uploads/p-1794669997451.mp4",
+    "caption": {
+      "tr": "Agayla Parkur",
+      "en": "Agayla Parkur"
+    },
+    "comments": [],
+    "isEdited": false
+  }
+]
