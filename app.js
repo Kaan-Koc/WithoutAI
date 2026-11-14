@@ -35,11 +35,38 @@ const state = {
 };
 
 const DB_NAME = 'withoutai_clean_db_v4';
+const LEGACY_DB_NAMES = [
+  'withoutai_clean_db_v4',
+  'withoutai_clean_db_v3',
+  'withoutai_clean_db_v2',
+  'withoutai_clean_db_v1',
+  'withoutai_media_db',
+  'withoutai_db',
+];
 const STORE_NAME = 'user_posts';
 
-function openMediaDB() {
+function getDeletedPostIds() {
+  try {
+    const raw = localStorage.getItem('withoutai_deleted_post_ids');
+    if (raw) {
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) return new Set(arr);
+    }
+  } catch (_) {}
+  return new Set();
+}
+
+function markPostIdDeleted(postId) {
+  try {
+    const set = getDeletedPostIds();
+    set.add(postId);
+    localStorage.setItem('withoutai_deleted_post_ids', JSON.stringify(Array.from(set)));
+  } catch (_) {}
+}
+
+function openMediaDB(dbName = DB_NAME) {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 1);
+    const req = indexedDB.open(dbName, 1);
     req.onupgradeneeded = (e) => {
       const db = e.target.result;
       if (!db.objectStoreNames.contains(STORE_NAME)) {
@@ -53,21 +80,29 @@ function openMediaDB() {
 
 async function saveUserPostToDB(post) {
   try {
-    const db = await openMediaDB();
-    const tx = db.transaction(STORE_NAME, 'readwrite');
-    tx.objectStore(STORE_NAME).put(post);
+    const db = await openMediaDB(DB_NAME);
+    return new Promise((resolve) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      tx.objectStore(STORE_NAME).put(post);
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => resolve(false);
+    });
   } catch (e) {
     console.warn('IndexedDB save skipped:', e);
+    return false;
   }
 }
 
 async function deleteUserPostFromDB(postId) {
-  try {
-    const db = await openMediaDB();
-    const tx = db.transaction(STORE_NAME, 'readwrite');
-    tx.objectStore(STORE_NAME).delete(postId);
-  } catch (e) {
-    console.warn('IndexedDB delete skipped:', e);
+  markPostIdDeleted(postId);
+  for (const name of LEGACY_DB_NAMES) {
+    try {
+      const db = await openMediaDB(name);
+      if (db.objectStoreNames.contains(STORE_NAME)) {
+        const tx = db.transaction(STORE_NAME, 'readwrite');
+        tx.objectStore(STORE_NAME).delete(postId);
+      }
+    } catch (_) {}
   }
 }
 
@@ -105,30 +140,7 @@ async function resolveCloudRepo() {
     DEFAULT_GH_BRANCH = cachedBranch;
     return { repo: cached, branch: cachedBranch };
   }
-  try {
-    const token = _getCloudToken();
-    const res = await fetch('https://api.github.com/user/repos?per_page=100&sort=updated', {
-      headers: {
-        Accept: 'application/vnd.github.v3+json',
-        Authorization: `Bearer ${token}`,
-      },
-    });
-    if (res.ok) {
-      const list = await res.json();
-      if (Array.isArray(list) && list.length > 0) {
-        const match =
-          list.find((r) => /without[-_ ]?ai/i.test(r.name)) || list[0];
-        if (match && match.full_name) {
-          DEFAULT_GH_REPO = match.full_name;
-          DEFAULT_GH_BRANCH = match.default_branch || 'main';
-          localStorage.setItem('withoutai_auto_repo', DEFAULT_GH_REPO);
-          localStorage.setItem('withoutai_auto_branch', DEFAULT_GH_BRANCH);
-          return { repo: DEFAULT_GH_REPO, branch: DEFAULT_GH_BRANCH };
-        }
-      }
-    }
-  } catch (_) {}
-  return { repo: '', branch: 'main' };
+  return { repo: 'Kaan-Koc/WithoutAI', branch: 'main' };
 }
 
 async function githubApiGetFile(repo, path, branch) {
@@ -152,67 +164,184 @@ async function githubApiPutFile(repo, path, branch, base64Content, message) {
     Authorization: `Bearer ${token}`,
     'Content-Type': 'application/json',
   };
-  let sha = null;
-  const existing = await githubApiGetFile(repo, path, branch);
-  if (existing && existing.sha) sha = existing.sha;
 
-  const body = {
-    message,
-    content: base64Content,
-    branch,
-  };
-  if (sha) body.sha = sha;
+  let lastErr = null;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      let sha = null;
+      const existing = await githubApiGetFile(repo, path, branch);
+      if (existing && existing.sha) sha = existing.sha;
 
-  const res = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
-    method: 'PUT',
-    headers,
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const errData = await res.json().catch(() => ({}));
-    throw new Error(errData.message || `GitHub API (${res.status})`);
+      const body = {
+        message,
+        content: base64Content,
+        branch,
+      };
+      if (sha) body.sha = sha;
+
+      const res = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
+        method: 'PUT',
+        headers,
+        body: JSON.stringify(body),
+      });
+      if (res.ok) {
+        return await res.json();
+      }
+      const errData = await res.json().catch(() => ({}));
+      lastErr = new Error(errData.message || `GitHub API (${res.status})`);
+      // Wait before retry on 409 Conflict or 5xx
+      await new Promise((r) => setTimeout(r, 650 * (attempt + 1)));
+    } catch (e) {
+      lastErr = e;
+      await new Promise((r) => setTimeout(r, 650 * (attempt + 1)));
+    }
   }
-  return await res.json();
+  throw lastErr || new Error('GitHub upload failed');
 }
 
 async function loadSharedPostsFromCloud() {
   const { repo, branch } = await resolveCloudRepo();
+  const deletedSet = getDeletedPostIds();
+  const cloudMap = new Map();
+
   if (repo) {
+    // 1. Read shared-posts.json via GitHub API (instant, no CDN cache delay)
     try {
       const fileData = await githubApiGetFile(repo, 'shared-posts.json', branch);
       if (fileData && fileData.content) {
         const jsonStr = decodeURIComponent(escape(atob(fileData.content.replace(/\s/g, ''))));
         const parsed = JSON.parse(jsonStr);
-        if (Array.isArray(parsed)) return parsed;
+        const postsArr = Array.isArray(parsed)
+          ? parsed
+          : parsed && Array.isArray(parsed.posts)
+          ? parsed.posts
+          : [];
+        const remoteDeleted =
+          parsed && Array.isArray(parsed.deletedIds) ? parsed.deletedIds : [];
+        for (const dId of remoteDeleted) {
+          deletedSet.add(dId);
+          markPostIdDeleted(dId);
+        }
+        for (const item of postsArr) {
+          if (item && item.id && !deletedSet.has(item.id)) {
+            cloudMap.set(item.id, item);
+          }
+        }
       }
     } catch (e) {
-      console.warn('Cloud API read fallback:', e);
+      console.warn('Cloud API shared-posts.json fallback:', e);
     }
+
+    // 2. Also scan uploads/ directory on GitHub so any uploaded video/photo file is NEVER lost
+    // even if shared-posts.json had a race condition when uploading multiple videos at once!
+    try {
+      const dirItems = await githubApiGetFile(repo, 'uploads', branch);
+      if (Array.isArray(dirItems)) {
+        for (const fileItem of dirItems) {
+          if (!fileItem || !fileItem.name) continue;
+          const m = fileItem.name.match(/^(p-\d+)\.(mp4|webm|mov|m4v|jpg|jpeg|png|webp)$/i);
+          if (!m) continue;
+          const postId = m[1];
+          const ext = m[2].toLowerCase();
+          if (deletedSet.has(postId) || cloudMap.has(postId)) continue;
+
+          const isVideo = ['mp4', 'webm', 'mov', 'm4v'].includes(ext);
+          const ts = Number(postId.replace('p-', '')) || Date.now();
+          const rawUrl = `https://raw.githubusercontent.com/${repo}/${branch}/uploads/${fileItem.name}`;
+
+          cloudMap.set(postId, {
+            id: postId,
+            feedCategory: 'following',
+            username: 'kaan.doc',
+            fullName: USER_PROFILES['kaan.doc'] ? USER_PROFILES['kaan.doc'].fullName : 'Kaan',
+            isFounding: true,
+            location: { tr: 'İstanbul', en: 'Istanbul' },
+            timeAgo: { tr: 'YENİ', en: 'NEW' },
+            timestamp: ts,
+            theme: '#photography',
+            score: 2,
+            badgeType: 'low',
+            badgeLabel: { tr: 'AI-filtered · %2', en: 'AI-filtered · 2%' },
+            camera: 'C2PA Verified Media',
+            likes: 1,
+            mediaType: isVideo ? 'video' : 'image',
+            mediaUrl: rawUrl,
+            remoteMediaUrl: rawUrl,
+            caption: { tr: 'Yeni paylaşım.', en: 'New post.' },
+            comments: [],
+          });
+        }
+      }
+    } catch (_) {}
   }
-  try {
-    const res = await fetch(`./shared-posts.json?t=${Date.now()}`, { cache: 'no-store' });
-    if (res.ok) {
-      const parsed = await res.json();
-      if (Array.isArray(parsed)) return parsed;
-    }
-  } catch (_) {}
-  return [];
+
+  if (cloudMap.size === 0) {
+    try {
+      const res = await fetch(`./shared-posts.json?t=${Date.now()}`, { cache: 'no-store' });
+      if (res.ok) {
+        const parsed = await res.json();
+        const arr = Array.isArray(parsed)
+          ? parsed
+          : parsed && Array.isArray(parsed.posts)
+          ? parsed.posts
+          : [];
+        for (const item of arr) {
+          if (item && item.id && !deletedSet.has(item.id)) {
+            cloudMap.set(item.id, item);
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  return Array.from(cloudMap.values());
 }
 
+let _cloudSyncRunning = false;
+let _cloudSyncQueued = false;
+
 async function syncAllUserPostsToCloud() {
+  if (_cloudSyncRunning) {
+    _cloudSyncQueued = true;
+    return false;
+  }
+  _cloudSyncRunning = true;
+
   try {
     const { repo, branch } = await resolveCloudRepo();
-    if (!repo) return false;
+    if (!repo) {
+      _cloudSyncRunning = false;
+      return false;
+    }
 
+    const deletedSet = getDeletedPostIds();
+
+    // First, read existing cloud posts so we NEVER overwrite posts uploaded earlier or from other devices
+    const existingCloudPosts = await loadSharedPostsFromCloud();
+    const mergedById = new Map();
+    for (const cp of existingCloudPosts) {
+      if (cp && cp.id && !deletedSet.has(cp.id)) {
+        mergedById.set(cp.id, cp);
+      }
+    }
+
+    // Now upload any new/unsynced local posts (with Blobs) one by one
     const customPosts = posts.filter(
-      (p) => p.username === 'kaan.doc' && (p.id.startsWith('p-') || p.isEdited)
+      (p) =>
+        p.username === 'kaan.doc' &&
+        !deletedSet.has(p.id) &&
+        (p.id.startsWith('p-') || p.isEdited)
     );
-    const serializedPosts = [];
 
+    let uploadedAnyNewBlob = false;
     for (const p of customPosts) {
       let remoteUrl = p.remoteMediaUrl || p.mediaUrl || '';
+      const needsMediaUpload =
+        p.blob instanceof Blob &&
+        (!remoteUrl || remoteUrl.startsWith('blob:') || !mergedById.has(p.id));
 
-      if (p.blob instanceof Blob && (!remoteUrl || remoteUrl.startsWith('blob:'))) {
+      if (needsMediaUpload) {
+        uploadedAnyNewBlob = true;
         const ext = p.mediaType === 'video' ? 'mp4' : 'jpg';
         const safeName = `${p.id}.${ext}`;
         const repoPath = `uploads/${safeName}`;
@@ -232,7 +361,7 @@ async function syncAllUserPostsToCloud() {
       }
 
       if (remoteUrl && !remoteUrl.startsWith('blob:')) {
-        serializedPosts.push({
+        mergedById.set(p.id, {
           id: p.id,
           feedCategory: p.feedCategory || 'following',
           username: 'kaan.doc',
@@ -257,7 +386,16 @@ async function syncAllUserPostsToCloud() {
       }
     }
 
-    const jsonString = JSON.stringify(serializedPosts, null, 2);
+    const serializedPosts = Array.from(mergedById.values())
+      .filter((p) => !deletedSet.has(p.id))
+      .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+
+    const payload = {
+      posts: serializedPosts,
+      deletedIds: Array.from(deletedSet),
+    };
+
+    const jsonString = JSON.stringify(payload, null, 2);
     const jsonBase64 = btoa(unescape(encodeURIComponent(jsonString)));
 
     await githubApiPutFile(
@@ -267,9 +405,20 @@ async function syncAllUserPostsToCloud() {
       jsonBase64,
       'Update shared-posts.json'
     );
+
+    _cloudSyncRunning = false;
+    if (_cloudSyncQueued) {
+      _cloudSyncQueued = false;
+      return await syncAllUserPostsToCloud();
+    }
     return true;
   } catch (err) {
     console.warn('Background cloud sync error:', err);
+    _cloudSyncRunning = false;
+    if (_cloudSyncQueued) {
+      _cloudSyncQueued = false;
+      setTimeout(() => syncAllUserPostsToCloud(), 1200);
+    }
     return false;
   }
 }
@@ -1199,34 +1348,88 @@ function formatBytes(bytes) {
   return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
 }
 
-async function loadUserPostsFromDB() {
-  try {
-    const db = await openMediaDB();
-    return new Promise((resolve) => {
-      const tx = db.transaction(STORE_NAME, 'readonly');
-      const req = tx.objectStore(STORE_NAME).getAll();
+function readPostsFromSingleDB(dbName) {
+  return new Promise((resolve) => {
+    try {
+      const req = indexedDB.open(dbName);
       req.onsuccess = () => {
-        const list = req.result || [];
-        const validPosts = [];
-        for (const p of list) {
-          p.username = 'kaan.doc';
-          p.fullName = USER_PROFILES['kaan.doc'].fullName;
-          p.avatar = AVATARS.kaan;
-          p.feedCategory = 'following';
-          if (p.blob instanceof Blob) {
-            p.mediaUrl = URL.createObjectURL(p.blob);
-            validPosts.push(p);
-          } else if (p.remoteMediaUrl) {
-            p.mediaUrl = p.remoteMediaUrl;
-            validPosts.push(p);
-          } else if (p.mediaUrl && !p.mediaUrl.startsWith('blob:')) {
-            validPosts.push(p);
-          }
+        const db = req.result;
+        const storeNames = Array.from(db.objectStoreNames || []);
+        if (storeNames.length === 0) {
+          db.close();
+          resolve([]);
+          return;
         }
-        resolve(validPosts);
+        const targetStore = storeNames.includes(STORE_NAME) ? STORE_NAME : storeNames[0];
+        try {
+          const tx = db.transaction(targetStore, 'readonly');
+          const getAllReq = tx.objectStore(targetStore).getAll();
+          getAllReq.onsuccess = () => {
+            const res = getAllReq.result || [];
+            db.close();
+            resolve(res);
+          };
+          getAllReq.onerror = () => {
+            db.close();
+            resolve([]);
+          };
+        } catch (_) {
+          db.close();
+          resolve([]);
+        }
       };
       req.onerror = () => resolve([]);
-    });
+    } catch (_) {
+      resolve([]);
+    }
+  });
+}
+
+async function loadUserPostsFromDB() {
+  try {
+    const deletedSet = getDeletedPostIds();
+    const dbNamesSet = new Set(LEGACY_DB_NAMES);
+
+    if (typeof indexedDB.databases === 'function') {
+      try {
+        const dbs = await indexedDB.databases();
+        for (const info of dbs || []) {
+          if (info && info.name && /withoutai/i.test(info.name)) {
+            dbNamesSet.add(info.name);
+          }
+        }
+      } catch (_) {}
+    }
+
+    const byId = new Map();
+    for (const dbName of dbNamesSet) {
+      const list = await readPostsFromSingleDB(dbName);
+      for (const rawPost of list) {
+        if (!rawPost || !rawPost.id || deletedSet.has(rawPost.id)) continue;
+        const p = { ...rawPost };
+        p.username = 'kaan.doc';
+        p.fullName = USER_PROFILES['kaan.doc'].fullName;
+        p.avatar = AVATARS.kaan;
+        p.feedCategory = 'following';
+
+        const blobObj = p.blob || p.file || p.mainBlob || p.mediaBlob;
+        if (blobObj instanceof Blob) {
+          p.blob = blobObj;
+          p.mediaUrl = URL.createObjectURL(blobObj);
+          byId.set(p.id, p);
+          if (dbName !== DB_NAME) {
+            saveUserPostToDB(p);
+          }
+        } else if (p.remoteMediaUrl) {
+          p.mediaUrl = p.remoteMediaUrl;
+          if (!byId.has(p.id)) byId.set(p.id, p);
+        } else if (p.mediaUrl && !p.mediaUrl.startsWith('blob:')) {
+          if (!byId.has(p.id)) byId.set(p.id, p);
+        }
+      }
+    }
+
+    return Array.from(byId.values());
   } catch (e) {
     return [];
   }
@@ -3101,30 +3304,41 @@ window.addEventListener('DOMContentLoaded', async () => {
   document.documentElement.setAttribute('data-theme', state.theme);
   document.documentElement.lang = state.lang;
 
-  // 1. Load local IndexedDB posts
+  // 1. Load local IndexedDB posts (across all current & legacy DB versions)
   const localPosts = await loadUserPostsFromDB();
-  // 2. Load shared cloud posts from GitHub (so other phones/PCs see uploaded videos & photos!)
+  // 2. Load shared cloud posts from GitHub (including any orphaned files in uploads/)
   const cloudPosts = await loadSharedPostsFromCloud();
 
-  // Merge cloud posts + local posts + defaultPosts without duplicates
+  const deletedSet = getDeletedPostIds();
   const mergedMap = new Map();
+
   for (const cp of cloudPosts) {
+    if (!cp || !cp.id || deletedSet.has(cp.id)) continue;
     cp.avatar = AVATARS.kaan;
     mergedMap.set(cp.id, cp);
   }
   for (const lp of localPosts) {
+    if (!lp || !lp.id || deletedSet.has(lp.id)) continue;
     lp.avatar = AVATARS.kaan;
+    const existingCloud = mergedMap.get(lp.id);
+    if (existingCloud && existingCloud.remoteMediaUrl && !lp.remoteMediaUrl) {
+      lp.remoteMediaUrl = existingCloud.remoteMediaUrl;
+    }
     mergedMap.set(lp.id, lp);
   }
 
   const userPostList = Array.from(mergedMap.values()).sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-  const remainingDefault = defaultPosts.filter((dp) => !mergedMap.has(dp.id));
+  const remainingDefault = defaultPosts.filter((dp) => !mergedMap.has(dp.id) && !deletedSet.has(dp.id));
 
   posts = [...userPostList, ...remainingDefault];
   renderAll();
 
-  // If this device has any local posts not yet synced to cloud, sync them silently in background
-  if (localPosts.some((lp) => lp.blob instanceof Blob && !lp.remoteMediaUrl)) {
+  // If this device has any local posts missing from cloudPosts or without remoteMediaUrl, sync them immediately!
+  const cloudIds = new Set(cloudPosts.map((cp) => cp.id));
+  const needsSync = localPosts.some(
+    (lp) => !cloudIds.has(lp.id) || (lp.blob instanceof Blob && !lp.remoteMediaUrl)
+  );
+  if (needsSync) {
     syncAllUserPostsToCloud();
   }
 });
