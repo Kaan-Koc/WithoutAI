@@ -1520,6 +1520,57 @@ function setTheme(th) {
   renderNavigation();
 }
 
+let dmDragState = {
+  isDown: false,
+  startX: 0,
+  startY: 0,
+  scrollLeft: 0,
+  scrollTop: 0,
+  moved: false,
+};
+
+function startDmBarDrag(e) {
+  const listEl = document.getElementById('dm-thread-list-bar');
+  if (!listEl) return;
+  dmDragState.isDown = true;
+  dmDragState.moved = false;
+  dmDragState.startX = e.pageX - listEl.offsetLeft;
+  dmDragState.startY = e.pageY - listEl.offsetTop;
+  dmDragState.scrollLeft = listEl.scrollLeft;
+  dmDragState.scrollTop = listEl.scrollTop;
+}
+
+function moveDmBarDrag(e) {
+  if (!dmDragState.isDown) return;
+  const listEl = document.getElementById('dm-thread-list-bar');
+  if (!listEl) return;
+  const x = e.pageX - listEl.offsetLeft;
+  const y = e.pageY - listEl.offsetTop;
+  const walkX = x - dmDragState.startX;
+  const walkY = y - dmDragState.startY;
+  if (Math.abs(walkX) > 6 || Math.abs(walkY) > 6) {
+    dmDragState.moved = true;
+    e.preventDefault();
+    if (window.innerWidth <= 780) {
+      listEl.scrollLeft = dmDragState.scrollLeft - walkX;
+    } else {
+      listEl.scrollTop = dmDragState.scrollTop - walkY;
+    }
+  }
+}
+
+function endDmBarDrag() {
+  dmDragState.isDown = false;
+  setTimeout(() => {
+    dmDragState.moved = false;
+  }, 50);
+}
+
+function handleDmThreadClick(username) {
+  if (dmDragState.moved) return;
+  selectDmThread(username);
+}
+
 function scrollDmToBottom() {
   const msgBox = document.getElementById('dm-messages-scroll');
   if (msgBox) {
@@ -1554,7 +1605,7 @@ function selectDmThread(username) {
     newThreadList.scrollLeft = prevScrollLeft;
     const activeItem = newThreadList.querySelector('.dm-thread-item.active');
     if (activeItem && typeof activeItem.scrollIntoView === 'function') {
-      activeItem.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' });
+      activeItem.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
     }
   }
   scrollDmToBottom();
@@ -1628,6 +1679,9 @@ function sendDirectMessage() {
     const emptyHint = msgBox.querySelector('.dm-empty-hint');
     if (emptyHint) emptyHint.remove();
 
+    const row = document.createElement('div');
+    row.className = 'dm-msg-row mine';
+
     const bubble = document.createElement('div');
     bubble.className = 'dm-bubble mine';
 
@@ -1635,12 +1689,13 @@ function sendDirectMessage() {
     textDiv.textContent = text;
 
     const timeDiv = document.createElement('div');
-    timeDiv.style.cssText = 'font-size:0.65rem; opacity:0.75; margin-top:3px; text-align:right;';
+    timeDiv.className = 'dm-bubble-time';
     timeDiv.textContent = nowLabel;
 
     bubble.appendChild(textDiv);
     bubble.appendChild(timeDiv);
-    msgBox.appendChild(bubble);
+    row.appendChild(bubble);
+    msgBox.appendChild(row);
     msgBox.scrollTop = msgBox.scrollHeight;
   }
 
@@ -2506,10 +2561,18 @@ function renderMessagesView() {
     <div class="dm-container">
       <div class="dm-sidebar">
         <div class="dm-sidebar-header">
-          <span>💬 ${isTr ? 'Mesajlar (kaan.doc)' : 'Messages (kaan.doc)'}</span>
-          <span class="ai-score-pill low" style="font-size:0.65rem; padding:2px 6px;">${threadUsers.length}</span>
+          <span>💬 ${isTr ? 'Mesajlar' : 'Messages'} <span style="font-weight:500; font-size:0.8rem; color:var(--text-muted);">@kaan.doc</span></span>
+          <span class="ai-score-pill low" style="font-size:0.65rem; padding:2px 7px;">${threadUsers.length}</span>
         </div>
-        <div id="dm-thread-list-bar" class="dm-thread-list" onwheel="handleDmThreadsWheel(event)">
+        <div
+          id="dm-thread-list-bar"
+          class="dm-thread-list"
+          onwheel="handleDmThreadsWheel(event)"
+          onmousedown="startDmBarDrag(event)"
+          onmousemove="moveDmBarDrag(event)"
+          onmouseup="endDmBarDrag()"
+          onmouseleave="endDmBarDrag()"
+        >
           ${threadUsers
             .map((u) => {
               const prof = USER_PROFILES[u];
@@ -2520,19 +2583,24 @@ function renderMessagesView() {
                 ? previewPrefix + lastMsg.text[state.lang]
                 : prof.role[state.lang];
               const timeText = lastMsg ? lastMsg.time : '';
+              const shortName = prof.fullName.split(' ')[0];
 
               return `
-              <div class="dm-thread-item ${u === activeUser ? 'active' : ''}" onclick="selectDmThread('${u}')">
-                <img class="ig-user-avatar" src="${prof.avatar}" alt="${u}" onerror="handleImgError(this)" />
+              <div class="dm-thread-item ${u === activeUser ? 'active' : ''}" onclick="handleDmThreadClick('${u}')">
+                <div class="dm-avatar-wrap">
+                  <img src="${prof.avatar}" alt="${u}" onerror="handleImgError(this)" />
+                  <span class="dm-online-dot"></span>
+                </div>
                 <div class="dm-thread-meta">
                   <div class="dm-thread-top">
-                    <span class="dm-thread-name">${u}</span>
+                    <span class="dm-thread-name">${prof.fullName}</span>
                     <span id="dm-time-${u}" class="dm-thread-time">${timeText}</span>
                   </div>
                   <div id="dm-preview-${u}" class="dm-thread-preview">
                     ${previewText}
                   </div>
                 </div>
+                <span class="dm-thread-mobile-label">${shortName}</span>
               </div>
             `;
             })
@@ -2543,32 +2611,49 @@ function renderMessagesView() {
       <div class="dm-chat-area">
         <div class="dm-chat-header">
           <div class="ig-post-user" style="min-width:0; flex:1;" onclick="openUserProfile('${activeProf.username}')">
-            <img class="ig-user-avatar" src="${activeProf.avatar}" alt="${activeProf.username}" onerror="handleImgError(this)" />
+            <img class="ig-user-avatar" style="width:42px; height:42px;" src="${activeProf.avatar}" alt="${activeProf.username}" onerror="handleImgError(this)" />
             <div style="min-width:0; flex:1;">
-              <div class="ig-username clickable-user">${activeProf.username}</div>
-              <div class="dm-thread-preview" style="font-size:0.74rem;">${activeProf.fullName} · ${activeProf.location[state.lang]}</div>
+              <div class="ig-username clickable-user" style="font-size:0.92rem;">${activeProf.fullName} <span style="font-weight:500; font-size:0.78rem; color:var(--text-muted);">@${activeProf.username}</span></div>
+              <div class="dm-thread-preview" style="font-size:0.74rem;">${activeProf.role[state.lang]} · ${activeProf.location[state.lang]}</div>
             </div>
           </div>
-          <button class="btn-outline" style="padding:0.38rem 0.7rem; font-size:0.75rem; flex-shrink:0;" onclick="openUserProfile('${activeProf.username}')">
+          <button class="btn-outline" style="padding:0.4rem 0.78rem; font-size:0.76rem; flex-shrink:0;" onclick="openUserProfile('${activeProf.username}')">
             👤 ${isTr ? 'Profile Git' : 'View Profile'}
           </button>
         </div>
 
         <div id="dm-messages-scroll" class="dm-messages-list">
+          <div class="dm-chat-intro">
+            <img src="${activeProf.avatar}" alt="${activeProf.username}" onerror="handleImgError(this)" />
+            <div style="font-weight:800; font-size:0.95rem;">${activeProf.fullName}</div>
+            <div style="font-size:0.76rem; color:var(--text-muted);">@${activeProf.username} · ${activeProf.role[state.lang]}</div>
+            <span class="ai-score-pill low" style="margin-top:0.35rem; font-size:0.65rem; padding:2px 8px;">
+              🛡️ ${isTr ? 'Doğrulanmış Gerçek Kullanıcı' : 'Verified Real Creator'}
+            </span>
+          </div>
+
           ${
             messages.length === 0
-              ? `<p class="dm-empty-hint" style="text-align:center; color:var(--text-muted); font-size:0.84rem; margin:auto 0;">
-                  ${isTr ? `👋 @${activeProf.username} ile sohbete başla.` : `👋 Start chatting with @${activeProf.username}.`}
+              ? `<p class="dm-empty-hint" style="text-align:center; color:var(--text-muted); font-size:0.82rem; padding:0.75rem 0;">
+                  ${isTr ? `👋 ${activeProf.fullName} ile sohbete başla.` : `👋 Start chatting with ${activeProf.fullName}.`}
                 </p>`
               : messages
-                  .map(
-                    (m) => `
-                  <div class="dm-bubble ${m.from === 'kaan.doc' ? 'mine' : 'theirs'}">
-                    <div>${m.text[state.lang]}</div>
-                    <div style="font-size:0.65rem; opacity:0.75; margin-top:3px; text-align:right;">${m.time}</div>
+                  .map((m) => {
+                    const isMine = m.from === 'kaan.doc';
+                    return `
+                  <div class="dm-msg-row ${isMine ? 'mine' : 'theirs'}">
+                    ${
+                      !isMine
+                        ? `<img class="dm-msg-avatar" src="${activeProf.avatar}" alt="${activeProf.username}" onerror="handleImgError(this)" />`
+                        : ''
+                    }
+                    <div class="dm-bubble ${isMine ? 'mine' : 'theirs'}">
+                      <div>${m.text[state.lang]}</div>
+                      <div class="dm-bubble-time">${m.time}</div>
+                    </div>
                   </div>
-                `
-                  )
+                `;
+                  })
                   .join('')
           }
         </div>
@@ -2579,10 +2664,10 @@ function renderMessagesView() {
             class="dm-text-field"
             type="text"
             autocomplete="off"
-            placeholder="${isTr ? `@${activeProf.username} kullanıcısına mesaj yaz...` : `Message @${activeProf.username}...`}"
+            placeholder="${isTr ? `${activeProf.fullName} kullanıcısına mesaj yaz...` : `Message ${activeProf.fullName}...`}"
             onkeydown="if(event.key==='Enter'){ event.preventDefault(); sendDirectMessage(); }"
           />
-          <button class="btn-primary" style="padding:0.52rem 1rem; border-radius:999px; flex-shrink:0;" onclick="sendDirectMessage()">
+          <button class="btn-primary" style="padding:0.55rem 1.05rem; border-radius:999px; flex-shrink:0;" onclick="sendDirectMessage()">
             ${isTr ? 'Gönder' : 'Send'}
           </button>
         </div>
