@@ -1,5 +1,18 @@
 // WithoutAI — Clean Instagram-Style Social Media App
-// <10% AI Threshold Filter (≥10% Auto-Removed) + Direct Messages + Edit Profile + Scrollable Stories
+// GitHub Cloud Database Sync (Cross-Device Photos/Videos) + Post Editing (Caption/Tag/Location/Media) + <10% AI Filter
+
+function detectDefaultGitHubRepo() {
+  const saved = localStorage.getItem('withoutai_gh_repo');
+  if (saved) return saved;
+  const host = window.location.hostname || '';
+  if (host.endsWith('.github.io')) {
+    const owner = host.replace('.github.io', '');
+    const pathParts = window.location.pathname.split('/').filter(Boolean);
+    const repo = pathParts[0] || '';
+    if (owner && repo) return `${owner}/${repo}`;
+  }
+  return '';
+}
 
 const state = {
   lang: localStorage.getItem('withoutai_lang') || 'tr',
@@ -11,15 +24,25 @@ const state = {
   exploreTheme: 'all',
   exploreQuery: '',
   activeDmUser: 'elif.ceramics',
-  modal: null, // null | { type: 'create' } | { type: 'report', postId } | { type: 'story', storyId } | { type: 'editProfile' } | { type: 'followers', listType, username }
+  modal: null, // null | { type: 'create' } | { type: 'editPost', postId } | { type: 'cloudSync' } | { type: 'report', postId } | { type: 'story', storyId } | { type: 'editProfile' } | { type: 'followers', listType, username }
   scanStatus: 'idle', // 'idle' | 'scanning' | 'blocked'
   simMode: 'real', // 'real' (<10% AI -> passes) | 'ai_test' (>=10% AI -> auto-removed/blocked)
-  blockedReport: null, // { score, reasonTr, reasonEn, fileName }
+  blockedReport: null,
 
-  // Real Uploaded Media State
-  uploadedMainMedia: null, // { blob, url, mediaType: 'image' | 'video', name, sizeText }
+  // Real Uploaded Media State (Create Post)
+  uploadedMainMedia: null, // { blob, url, mediaType: 'image' | 'video', name, sizeText, hasAiKeyword }
   captionDraft: '',
   themeDraft: '#photography',
+  locationDraft: 'İstanbul',
+
+  // Edit Post Draft State
+  editPostDraft: null, // { postId, caption, theme, location, camera, newMedia: null }
+
+  // GitHub Cloud Database Config
+  ghRepo: detectDefaultGitHubRepo(), // e.g. 'username/WithoutAI'
+  ghBranch: localStorage.getItem('withoutai_gh_branch') || 'main',
+  ghToken: localStorage.getItem('withoutai_gh_token') || '',
+  syncInProgress: false,
 };
 
 const DB_NAME = 'withoutai_clean_db_v4';
@@ -56,6 +79,198 @@ async function deleteUserPostFromDB(postId) {
     tx.objectStore(STORE_NAME).delete(postId);
   } catch (e) {
     console.warn('IndexedDB delete skipped:', e);
+  }
+}
+
+// ==================== GITHUB CLOUD DATABASE SYNC (CROSS-DEVICE) ====================
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const dataUrl = reader.result || '';
+      const base64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
+      resolve(base64);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function githubApiGetFile(repo, path, branch, token) {
+  const headers = { Accept: 'application/vnd.github.v3+json' };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const res = await fetch(
+    `https://api.github.com/repos/${repo}/contents/${path}?ref=${encodeURIComponent(branch)}&t=${Date.now()}`,
+    { headers, cache: 'no-store' }
+  );
+  if (!res.ok) return null;
+  return await res.json();
+}
+
+async function githubApiPutFile(repo, path, branch, token, base64Content, message, existingSha = null) {
+  const headers = {
+    Accept: 'application/vnd.github.v3+json',
+    Authorization: `Bearer ${token}`,
+    'Content-Type': 'application/json',
+  };
+  let sha = existingSha;
+  if (!sha) {
+    const existing = await githubApiGetFile(repo, path, branch, token);
+    if (existing && existing.sha) sha = existing.sha;
+  }
+  const body = {
+    message,
+    content: base64Content,
+    branch,
+  };
+  if (sha) body.sha = sha;
+
+  const res = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
+    method: 'PUT',
+    headers,
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData.message || `GitHub API Error (${res.status})`);
+  }
+  return await res.json();
+}
+
+// Load shared posts so ANY device (phone, tablet, other PC) sees uploaded photos & videos!
+async function loadSharedPostsFromCloud() {
+  const repo = state.ghRepo || detectDefaultGitHubRepo();
+  const branch = state.ghBranch || 'main';
+
+  // 1. Try reading live from GitHub API / Raw URL if repo is known or auto-detected from github.io
+  if (repo && repo.includes('/')) {
+    try {
+      const fileData = await githubApiGetFile(repo, 'shared-posts.json', branch, state.ghToken);
+      if (fileData && fileData.content) {
+        const jsonStr = decodeURIComponent(escape(atob(fileData.content.replace(/\s/g, ''))));
+        const parsed = JSON.parse(jsonStr);
+        if (Array.isArray(parsed)) return parsed;
+      }
+    } catch (e) {
+      console.warn('GitHub API read fallback:', e);
+    }
+  }
+
+  // 2. Also try reading relative ./shared-posts.json in the same hosted directory
+  try {
+    const res = await fetch(`./shared-posts.json?t=${Date.now()}`, { cache: 'no-store' });
+    if (res.ok) {
+      const parsed = await res.json();
+      if (Array.isArray(parsed)) return parsed;
+    }
+  } catch (_) {}
+
+  return [];
+}
+
+// Upload media file (if blob) to GitHub 'uploads/' folder and update 'shared-posts.json'
+async function syncAllUserPostsToGitHub(showFeedback = false) {
+  const repo = (state.ghRepo || '').trim();
+  const token = (state.ghToken || '').trim();
+  const branch = (state.ghBranch || 'main').trim() || 'main';
+
+  if (!repo || !token) {
+    if (showFeedback) {
+      openCloudSyncModal();
+    }
+    return false;
+  }
+
+  state.syncInProgress = true;
+  if (state.modal && state.modal.type === 'cloudSync') renderModal();
+
+  try {
+    // Collect all user-uploaded posts (id starting with 'p-') or edited k1 post
+    const customPosts = posts.filter((p) => p.username === 'kaan.doc' && (p.id.startsWith('p-') || p.isEdited));
+    const serializedPosts = [];
+
+    for (const p of customPosts) {
+      let remoteUrl = p.remoteMediaUrl || p.mediaUrl || '';
+
+      // If this post has a local Blob that hasn't been uploaded to GitHub yet, upload it to uploads/
+      if (p.blob instanceof Blob && (!remoteUrl || remoteUrl.startsWith('blob:'))) {
+        const ext = p.mediaType === 'video' ? 'mp4' : 'jpg';
+        const safeName = `${p.id}.${ext}`;
+        const repoPath = `uploads/${safeName}`;
+        const base64Data = await blobToBase64(p.blob);
+
+        await githubApiPutFile(
+          repo,
+          repoPath,
+          branch,
+          token,
+          base64Data,
+          `Upload media ${safeName} via WithoutAI`
+        );
+
+        remoteUrl = `https://raw.githubusercontent.com/${repo}/${branch}/${repoPath}`;
+        p.remoteMediaUrl = remoteUrl;
+        await saveUserPostToDB(p);
+      }
+
+      if (remoteUrl && !remoteUrl.startsWith('blob:')) {
+        serializedPosts.push({
+          id: p.id,
+          feedCategory: p.feedCategory || 'following',
+          username: 'kaan.doc',
+          fullName: p.fullName || 'Kaan',
+          isFounding: true,
+          location: p.location,
+          timeAgo: p.timeAgo,
+          timestamp: p.timestamp,
+          theme: p.theme,
+          score: p.score || 1,
+          badgeType: p.badgeType || 'low',
+          badgeLabel: p.badgeLabel,
+          camera: p.camera || 'C2PA Verified Media',
+          likes: p.likes || 1,
+          mediaType: p.mediaType,
+          mediaUrl: remoteUrl,
+          remoteMediaUrl: remoteUrl,
+          caption: p.caption,
+          comments: p.comments || [],
+          isEdited: Boolean(p.isEdited),
+        });
+      }
+    }
+
+    const jsonString = JSON.stringify(serializedPosts, null, 2);
+    const jsonBase64 = btoa(unescape(encodeURIComponent(jsonString)));
+
+    await githubApiPutFile(
+      repo,
+      'shared-posts.json',
+      branch,
+      token,
+      jsonBase64,
+      'Sync shared-posts.json via WithoutAI'
+    );
+
+    state.syncInProgress = false;
+    if (state.modal && state.modal.type === 'cloudSync') renderModal();
+
+    if (showFeedback) {
+      toast(
+        state.lang === 'tr'
+          ? '☁️ Tüm fotoğraf ve videoların GitHub depona eşitlendi! Artık her cihazda görünür.'
+          : '☁️ All your photos and videos are synced to GitHub! Visible on all devices.'
+      );
+    }
+    return true;
+  } catch (err) {
+    state.syncInProgress = false;
+    if (state.modal && state.modal.type === 'cloudSync') renderModal();
+    toast(
+      state.lang === 'tr'
+        ? `⚠️ GitHub Senkronizasyon Hatası: ${err.message}`
+        : `⚠️ GitHub Sync Error: ${err.message}`
+    );
+    return false;
   }
 }
 
@@ -238,7 +453,7 @@ const USER_PROFILES = {
 };
 
 // Direct Messages (DM) Conversations
-let dmConversations = {
+const defaultDmConversations = {
   'elif.ceramics': [
     { from: 'elif.ceramics', text: { tr: 'Selam Kaan! Son paylaştığın Beyoğlu fotoğrafındaki ışık harikaydı.', en: 'Hey Kaan! The light in your latest Beyoğlu photo was amazing.' }, time: '14:20' },
     { from: 'kaan.doc', text: { tr: 'Çok teşekkürler Elif! Senin yeni taş çini vazolar da çok zarif olmuş.', en: 'Thank you so much Elif! Your new stoneware vases turned out so elegant too.' }, time: '14:25' },
@@ -252,9 +467,34 @@ let dmConversations = {
   'zeynep.35mm': [
     { from: 'zeynep.35mm', text: { tr: 'Sabah Karaköy vapurunda çektiğin kareler çok iyiydi 👏', en: 'The frames you shot on the Karaköy ferry this morning were great 👏' }, time: '3g' },
   ],
+  'lara.analog': [
+    { from: 'lara.analog', text: { tr: 'Balat’ta orta format çekim için harika bir sabah ışığı var.', en: 'Great morning light in Balat for a medium format shoot.' }, time: '4g' },
+  ],
+  'emre.street': [
+    { from: 'emre.street', text: { tr: 'Kapadokya serisinden yeni baskılar hazır, İstanbul’a gelince uğrayacağım.', en: 'New prints from the Cappadocia series are ready, will drop by when in Istanbul.' }, time: '5g' },
+  ],
 };
 
-// Rich Artistic Canvas Fallback (only if offline or blocked by network)
+let dmConversations = (() => {
+  try {
+    const saved = localStorage.getItem('withoutai_dm_v2');
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      if (parsed && typeof parsed === 'object') {
+        return { ...defaultDmConversations, ...parsed };
+      }
+    }
+  } catch (_) {}
+  return { ...defaultDmConversations };
+})();
+
+function saveDmConversations() {
+  try {
+    localStorage.setItem('withoutai_dm_v2', JSON.stringify(dmConversations));
+  } catch (_) {}
+}
+
+// Rich Artistic Canvas Fallback
 window.handleImgError = function (imgEl) {
   imgEl.onerror = null;
   const c = document.createElement('canvas');
@@ -300,7 +540,7 @@ window.handleImgError = function (imgEl) {
   imgEl.src = c.toDataURL('image/jpeg', 0.92);
 };
 
-// Stories Data (9 Creators + Add Story = 10 Items)
+// Stories Data
 let stories = [
   {
     id: 's1',
@@ -788,6 +1028,7 @@ const dict = {
       explore: 'Keşfet',
       messages: 'Mesajlar',
       create: 'Fotoğraf / Video Yükle',
+      cloudSync: 'GitHub Bulut Eşitleme',
       activity: 'Bildirimler',
       profile: 'Profilim',
       day: 'Gündüz',
@@ -798,8 +1039,10 @@ const dict = {
       featured: '✨ Öne Çıkanlar',
       quickUpload: '➕ Yükle',
       yourStory: 'Hikaye Ekle',
+      editBtn: 'Düzenle',
       deleteBtn: 'Sil',
       deletedToast: 'Gönderin silindi.',
+      updatedToast: 'Gönderin başarıyla güncellendi!',
       likes: 'beğenme',
       addComment: 'Yorum ekle...',
       postBtn: 'Paylaş',
@@ -822,11 +1065,21 @@ const dict = {
       removeMedia: '🗑️ Kaldır / Değiştir',
       captionLabel: 'Açıklama',
       themeLabel: 'Etiket',
+      locationLabel: 'Konum',
       simTitle: '🧪 AI Filtre Tarama Modu (Eşik: Maksimum %10 AI)',
       simReal: '🟢 Gerçek İçerik (%2 AI · Onaylanır)',
       simAi: '🔴 Şüpheli AI Testi (%84 AI · ≥%10 Kaldırılır)',
       scanBtn: '🚀 AI Filtresinden Geçir ve Paylaş',
       scanning: 'AI filtresi pikselleri ve C2PA imzasını tarıyor...',
+    },
+    editPostModal: {
+      title: 'Gönderiyi Düzenle',
+      changeMedia: '📸 🎬 Fotoğrafı / Videoyu Değiştir (İsteğe Bağlı)',
+      captionLabel: 'Açıklama',
+      themeLabel: 'Etiket (#photography, #handmade, #art)',
+      locationLabel: 'Konum',
+      cameraLabel: 'Kamera / Ekipman Bilgisi',
+      saveBtn: '💾 Değişiklikleri Kaydet',
     },
     reportModal: {
       title: 'Gönderi & AI Filtre Raporu',
@@ -838,7 +1091,8 @@ const dict = {
       kvkkVal: 'Paylaşım öncesi otomatik silindi',
       fsek: 'Telif Hakkı (FSEK)',
       fsekVal: 'Kullanıcıya aittir · AI eğitimine kapalı',
-      deletePost: '🗑️ Bu Gönderiyi Sil',
+      editPost: '✏️ Gönderiyi Düzenle',
+      deletePost: '🗑️ Sil',
       viewProfile: '👤 Profile Git',
       close: 'Kapat',
     },
@@ -850,6 +1104,7 @@ const dict = {
       explore: 'Explore',
       messages: 'Messages',
       create: 'Upload Photo / Video',
+      cloudSync: 'GitHub Cloud Sync',
       activity: 'Notifications',
       profile: 'My Profile',
       day: 'Light',
@@ -860,8 +1115,10 @@ const dict = {
       featured: '✨ Featured',
       quickUpload: '➕ Upload',
       yourStory: 'Add Story',
+      editBtn: 'Edit',
       deleteBtn: 'Delete',
       deletedToast: 'Your post was deleted.',
+      updatedToast: 'Your post was updated!',
       likes: 'likes',
       addComment: 'Add a comment...',
       postBtn: 'Post',
@@ -884,11 +1141,21 @@ const dict = {
       removeMedia: '🗑️ Remove / Change',
       captionLabel: 'Caption',
       themeLabel: 'Tag',
+      locationLabel: 'Location',
       simTitle: '🧪 AI Filter Scan Mode (Threshold: Max 10% AI)',
       simReal: '🟢 Real Content (2% AI · Approved)',
       simAi: '🔴 Suspected AI Test (84% AI · ≥10% Removed)',
       scanBtn: '🚀 Scan with AI Filter & Share',
       scanning: 'AI filter scanning pixels & C2PA signature...',
+    },
+    editPostModal: {
+      title: 'Edit Post',
+      changeMedia: '📸 🎬 Replace Photo / Video (Optional)',
+      captionLabel: 'Caption',
+      themeLabel: 'Tag (#photography, #handmade, #art)',
+      locationLabel: 'Location',
+      cameraLabel: 'Camera / Gear Info',
+      saveBtn: '💾 Save Changes',
     },
     reportModal: {
       title: 'Post & AI Filter Report',
@@ -900,7 +1167,8 @@ const dict = {
       kvkkVal: 'Deleted before posting',
       fsek: 'Copyright (FSEK)',
       fsekVal: 'Creator owned · Never trains AI',
-      deletePost: '🗑️ Delete This Post',
+      editPost: '✏️ Edit Post',
+      deletePost: '🗑️ Delete',
       viewProfile: '👤 View Profile',
       close: 'Close',
     },
@@ -922,7 +1190,7 @@ function toast(msg) {
   if (!el) return;
   el.textContent = msg;
   el.classList.add('show');
-  setTimeout(() => el.classList.remove('show'), 3000);
+  setTimeout(() => el.classList.remove('show'), 3200);
 }
 
 function formatBytes(bytes) {
@@ -948,6 +1216,9 @@ async function loadUserPostsFromDB() {
           if (p.blob instanceof Blob) {
             p.mediaUrl = URL.createObjectURL(p.blob);
             validPosts.push(p);
+          } else if (p.remoteMediaUrl) {
+            p.mediaUrl = p.remoteMediaUrl;
+            validPosts.push(p);
           } else if (p.mediaUrl && !p.mediaUrl.startsWith('blob:')) {
             validPosts.push(p);
           }
@@ -961,7 +1232,7 @@ async function loadUserPostsFromDB() {
   }
 }
 
-// ==================== STORIES BAR SCROLLING (WHEEL + DRAG + TOUCH) ====================
+// ==================== STORIES BAR SCROLLING ====================
 let storiesDragState = {
   isDown: false,
   startX: 0,
@@ -1046,6 +1317,46 @@ function setTheme(th) {
   renderNavigation();
 }
 
+function scrollDmToBottom() {
+  const msgBox = document.getElementById('dm-messages-scroll');
+  if (msgBox) {
+    msgBox.scrollTop = msgBox.scrollHeight;
+  }
+}
+
+function handleDmThreadsWheel(e) {
+  const listEl = document.getElementById('dm-thread-list-bar');
+  if (!listEl) return;
+  if (window.innerWidth <= 780 && Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+    e.preventDefault();
+    listEl.scrollLeft += e.deltaY;
+  }
+}
+
+function selectDmThread(username) {
+  if (!username || username === 'kaan.doc') return;
+  if (!dmConversations[username]) {
+    dmConversations[username] = [];
+  }
+  const threadList = document.getElementById('dm-thread-list-bar');
+  const prevScrollTop = threadList ? threadList.scrollTop : 0;
+  const prevScrollLeft = threadList ? threadList.scrollLeft : 0;
+
+  state.activeDmUser = username;
+  renderMain();
+
+  const newThreadList = document.getElementById('dm-thread-list-bar');
+  if (newThreadList) {
+    newThreadList.scrollTop = prevScrollTop;
+    newThreadList.scrollLeft = prevScrollLeft;
+    const activeItem = newThreadList.querySelector('.dm-thread-item.active');
+    if (activeItem && typeof activeItem.scrollIntoView === 'function') {
+      activeItem.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' });
+    }
+  }
+  scrollDmToBottom();
+}
+
 function setPage(p) {
   if (p === 'profile') {
     state.profileUser = 'kaan.doc';
@@ -1054,6 +1365,9 @@ function setPage(p) {
   window.scrollTo({ top: 0, behavior: 'smooth' });
   renderNavigation();
   renderMain();
+  if (p === 'messages') {
+    scrollDmToBottom();
+  }
 }
 
 function openUserProfile(username) {
@@ -1086,23 +1400,57 @@ function openDirectMessageWith(username) {
   }
   renderNavigation();
   renderMain();
+  scrollDmToBottom();
 }
 
 function sendDirectMessage() {
   const input = document.getElementById('dm-message-input');
   if (!input || !input.value.trim()) return;
   const text = input.value.trim();
-  const target = state.activeDmUser;
+  const target = state.activeDmUser || 'elif.ceramics';
+  const nowLabel = state.lang === 'tr' ? 'Şimdi' : 'Now';
+
   if (!dmConversations[target]) dmConversations[target] = [];
   dmConversations[target].push({
     from: 'kaan.doc',
     text: { tr: text, en: text },
-    time: state.lang === 'tr' ? 'Şimdi' : 'Now',
+    time: nowLabel,
   });
+  saveDmConversations();
+
   input.value = '';
-  renderMain();
+
   const msgBox = document.getElementById('dm-messages-scroll');
-  if (msgBox) msgBox.scrollTop = msgBox.scrollHeight;
+  if (msgBox) {
+    const emptyHint = msgBox.querySelector('.dm-empty-hint');
+    if (emptyHint) emptyHint.remove();
+
+    const bubble = document.createElement('div');
+    bubble.className = 'dm-bubble mine';
+
+    const textDiv = document.createElement('div');
+    textDiv.textContent = text;
+
+    const timeDiv = document.createElement('div');
+    timeDiv.style.cssText = 'font-size:0.65rem; opacity:0.75; margin-top:3px; text-align:right;';
+    timeDiv.textContent = nowLabel;
+
+    bubble.appendChild(textDiv);
+    bubble.appendChild(timeDiv);
+    msgBox.appendChild(bubble);
+    msgBox.scrollTop = msgBox.scrollHeight;
+  }
+
+  const previewEl = document.getElementById(`dm-preview-${target}`);
+  if (previewEl) {
+    previewEl.textContent = (state.lang === 'tr' ? 'Sen: ' : 'You: ') + text;
+  }
+  const timeEl = document.getElementById(`dm-time-${target}`);
+  if (timeEl) {
+    timeEl.textContent = nowLabel;
+  }
+
+  input.focus();
 }
 
 function toggleFollowUser(username) {
@@ -1124,6 +1472,38 @@ function openFollowersModal(listType, username) {
 function openEditProfileModal() {
   state.modal = { type: 'editProfile' };
   renderModal();
+}
+
+function openCloudSyncModal() {
+  state.modal = { type: 'cloudSync' };
+  renderModal();
+}
+
+async function saveCloudSyncSettings() {
+  const repoEl = document.getElementById('gh-repo-input');
+  const branchEl = document.getElementById('gh-branch-input');
+  const tokenEl = document.getElementById('gh-token-input');
+
+  if (repoEl) {
+    let val = repoEl.value.trim();
+    val = val.replace(/^https?:\/\/github\.com\//i, '').replace(/\.git$/i, '').replace(/\/$/, '');
+    state.ghRepo = val;
+    localStorage.setItem('withoutai_gh_repo', val);
+  }
+  if (branchEl && branchEl.value.trim()) {
+    state.ghBranch = branchEl.value.trim();
+    localStorage.setItem('withoutai_gh_branch', state.ghBranch);
+  }
+  if (tokenEl) {
+    state.ghToken = tokenEl.value.trim();
+    localStorage.setItem('withoutai_gh_token', state.ghToken);
+  }
+
+  renderNavigation();
+  const ok = await syncAllUserPostsToGitHub(true);
+  if (ok) {
+    closeModal();
+  }
 }
 
 function handleProfileAvatarInput(e) {
@@ -1165,6 +1545,92 @@ function saveProfileEdits() {
   closeModal();
   renderMain();
   toast(state.lang === 'tr' ? 'Profil bilgilerin güncellendi!' : 'Profile updated!');
+}
+
+// ==================== EDIT UPLOADED POSTS (CAPTION, TAG, LOCATION, CAMERA, MEDIA) ====================
+function openEditPostModal(postId) {
+  const post = posts.find((p) => p.id === postId);
+  if (!post || post.username !== 'kaan.doc') return;
+
+  state.editPostDraft = {
+    postId: post.id,
+    caption: post.caption[state.lang] || '',
+    theme: post.theme || '#photography',
+    location: post.location[state.lang] || 'İstanbul',
+    camera: post.camera || 'C2PA Verified Media',
+    newMedia: null,
+  };
+  state.modal = { type: 'editPost', postId: post.id };
+  renderModal();
+}
+
+function syncEditPostInputs() {
+  if (!state.editPostDraft) return;
+  const capEl = document.getElementById('edit-post-caption');
+  const thEl = document.getElementById('edit-post-theme');
+  const locEl = document.getElementById('edit-post-location');
+  const camEl = document.getElementById('edit-post-camera');
+
+  if (capEl) state.editPostDraft.caption = capEl.value;
+  if (thEl) state.editPostDraft.theme = thEl.value;
+  if (locEl) state.editPostDraft.location = locEl.value;
+  if (camEl) state.editPostDraft.camera = camEl.value;
+}
+
+function handleEditPostMediaInput(e) {
+  const file = e.target.files && e.target.files[0];
+  if (!file || !state.editPostDraft) return;
+  syncEditPostInputs();
+  const mediaObj = createMediaObjectFromFile(file);
+  if (mediaObj.hasAiKeyword) {
+    toast(
+      state.lang === 'tr'
+        ? '⛔ Seçilen dosyada ≥%10 AI izi tespit edildiği için değiştirilemedi!'
+        : '⛔ Selected file has ≥10% AI trace and cannot be used!'
+    );
+    return;
+  }
+  state.editPostDraft.newMedia = mediaObj;
+  renderModal();
+}
+
+async function saveEditedPost() {
+  if (!state.editPostDraft) return;
+  syncEditPostInputs();
+
+  const post = posts.find((p) => p.id === state.editPostDraft.postId);
+  if (!post || post.username !== 'kaan.doc') return;
+
+  const newCap = state.editPostDraft.caption.trim() || post.caption[state.lang];
+  let newTheme = state.editPostDraft.theme.trim() || '#photography';
+  if (!newTheme.startsWith('#')) newTheme = '#' + newTheme;
+  const newLoc = state.editPostDraft.location.trim() || 'İstanbul';
+  const newCam = state.editPostDraft.camera.trim() || 'C2PA Verified Media';
+
+  post.caption = { tr: newCap, en: newCap };
+  post.theme = newTheme;
+  post.location = { tr: newLoc, en: newLoc };
+  post.camera = newCam;
+  post.isEdited = true;
+
+  if (state.editPostDraft.newMedia) {
+    post.blob = state.editPostDraft.newMedia.blob;
+    post.mediaType = state.editPostDraft.newMedia.mediaType;
+    post.mediaUrl = state.editPostDraft.newMedia.url;
+    post.remoteMediaUrl = null;
+  }
+
+  await saveUserPostToDB(post);
+
+  state.editPostDraft = null;
+  state.modal = null;
+  renderModal();
+  renderMain();
+  toast(tr('feed.updatedToast'));
+
+  if (state.ghRepo && state.ghToken) {
+    syncAllUserPostsToGitHub(false);
+  }
 }
 
 // ==================== POST ACTIONS (LIKE, DOUBLE-CLICK HEART, SAVE, COMMENT) ====================
@@ -1281,6 +1747,10 @@ async function deletePost(postId) {
   }
 
   toast(tr('feed.deletedToast'));
+
+  if (state.ghRepo && state.ghToken) {
+    syncAllUserPostsToGitHub(false);
+  }
 }
 
 // ONLY kaan.doc's own stories can be deleted!
@@ -1313,7 +1783,6 @@ function createMediaObjectFromFile(file) {
   const sizeText = `${file.name} (${formatBytes(file.size)})`;
   const url = URL.createObjectURL(file);
 
-  // Automatic filename check for AI generators (midjourney, dalle, flux, sora, etc.)
   const lowerName = file.name.toLowerCase();
   const hasAiKeyword = /(midjourney|dalle|dall-e|stable[-_ ]?diffusion|flux|sora|runway|comfyui|ai[-_ ]?gen)/i.test(lowerName);
 
@@ -1332,6 +1801,7 @@ function openCreateModal() {
   state.scanStatus = 'idle';
   state.simMode = 'real';
   state.blockedReport = null;
+  state.locationDraft = USER_PROFILES['kaan.doc'].location[state.lang] || 'İstanbul';
   renderModal();
 }
 
@@ -1425,8 +1895,10 @@ function handleStoryUploadInput(e) {
 function syncModalInputs() {
   const capEl = document.getElementById('create-caption-input');
   const thEl = document.getElementById('create-theme-select');
+  const locEl = document.getElementById('create-location-input');
   if (capEl) state.captionDraft = capEl.value;
   if (thEl) state.themeDraft = thEl.value;
+  if (locEl) state.locationDraft = locEl.value;
 }
 
 // Strict Platform Rule: AI Score >= 10% is AUTOMATICALLY REMOVED / BLOCKED!
@@ -1470,6 +1942,7 @@ async function scanAndPublishPost() {
     const captionText =
       state.captionDraft.trim() ||
       (state.lang === 'tr' ? 'Yeni paylaşım.' : 'New post.');
+    const locText = (state.locationDraft || '').trim() || 'İstanbul';
 
     const newPost = {
       id: 'p-' + Date.now(),
@@ -1478,7 +1951,7 @@ async function scanAndPublishPost() {
       fullName: USER_PROFILES['kaan.doc'].fullName,
       avatar: AVATARS.kaan,
       isFounding: true,
-      location: USER_PROFILES['kaan.doc'].location,
+      location: { tr: locText, en: locText },
       timeAgo: { tr: 'ŞİMDİ', en: 'JUST NOW' },
       timestamp: Date.now(),
       theme: state.themeDraft || '#photography',
@@ -1519,7 +1992,12 @@ async function scanAndPublishPost() {
         ? `✅ AI oranı %${scoreVal} (<%10) doğrulandı ve paylaşıldı!`
         : `✅ AI score ${scoreVal}% (<10%) verified and shared!`
     );
-  }, 650);
+
+    // If GitHub Cloud Sync is connected, automatically push the new photo/video to GitHub!
+    if (state.ghRepo && state.ghToken) {
+      syncAllUserPostsToGitHub(true);
+    }
+  }, 600);
 }
 
 // Render Media Element
@@ -1561,9 +2039,14 @@ function renderPostCard(post) {
           </button>
           ${
             isMyPost
-              ? `<button class="delete-post-btn" onclick="deletePost('${post.id}')" title="${tr('feed.deleteBtn')}">
-                  🗑️ ${tr('feed.deleteBtn')}
-                </button>`
+              ? `
+              <button class="edit-post-btn" onclick="openEditPostModal('${post.id}')" title="${tr('feed.editBtn')}">
+                ✏️ ${tr('feed.editBtn')}
+              </button>
+              <button class="delete-post-btn" onclick="deletePost('${post.id}')" title="${tr('feed.deleteBtn')}">
+                🗑️ ${tr('feed.deleteBtn')}
+              </button>
+            `
               : ''
           }
         </div>
@@ -1667,7 +2150,7 @@ function renderHomeView() {
           </button>
         </div>
 
-        <!-- Scrollable Stories Bar with Mouse Wheel & Touch/Drag (No Overlapping Arrows) -->
+        <!-- Scrollable Stories Bar -->
         <div class="stories-wrapper">
           <div
             id="stories-scroll-bar"
@@ -1795,7 +2278,6 @@ function renderExploreView() {
 
   return `
     <div class="explore-container">
-      <!-- Real-time Search Bar -->
       <div class="explore-search-bar">
         <span>🔍</span>
         <input
@@ -1862,20 +2344,31 @@ function renderMessagesView() {
     <div class="dm-container">
       <div class="dm-sidebar">
         <div class="dm-sidebar-header">
-          💬 ${isTr ? 'Mesajlar (kaan.doc)' : 'Messages (kaan.doc)'}
+          <span>💬 ${isTr ? 'Mesajlar (kaan.doc)' : 'Messages (kaan.doc)'}</span>
+          <span class="ai-score-pill low" style="font-size:0.65rem; padding:2px 6px;">${threadUsers.length}</span>
         </div>
-        <div class="dm-thread-list">
+        <div id="dm-thread-list-bar" class="dm-thread-list" onwheel="handleDmThreadsWheel(event)">
           ${threadUsers
             .map((u) => {
               const prof = USER_PROFILES[u];
               const lastMsg = (dmConversations[u] || []).slice(-1)[0];
+              const previewPrefix =
+                lastMsg && lastMsg.from === 'kaan.doc' ? (isTr ? 'Sen: ' : 'You: ') : '';
+              const previewText = lastMsg
+                ? previewPrefix + lastMsg.text[state.lang]
+                : prof.role[state.lang];
+              const timeText = lastMsg ? lastMsg.time : '';
+
               return `
-              <div class="dm-thread-item ${u === activeUser ? 'active' : ''}" onclick="state.activeDmUser='${u}'; renderMain();">
+              <div class="dm-thread-item ${u === activeUser ? 'active' : ''}" onclick="selectDmThread('${u}')">
                 <img class="ig-user-avatar" src="${prof.avatar}" alt="${u}" onerror="handleImgError(this)" />
-                <div style="min-width:0; flex:1;">
-                  <div class="ig-username" style="font-size:0.85rem;">${u}</div>
-                  <div class="ig-post-sub" style="font-size:0.72rem;">
-                    ${lastMsg ? lastMsg.text[state.lang] : prof.role[state.lang]}
+                <div class="dm-thread-meta">
+                  <div class="dm-thread-top">
+                    <span class="dm-thread-name">${u}</span>
+                    <span id="dm-time-${u}" class="dm-thread-time">${timeText}</span>
+                  </div>
+                  <div id="dm-preview-${u}" class="dm-thread-preview">
+                    ${previewText}
                   </div>
                 </div>
               </div>
@@ -1887,14 +2380,14 @@ function renderMessagesView() {
 
       <div class="dm-chat-area">
         <div class="dm-chat-header">
-          <div class="ig-post-user" onclick="openUserProfile('${activeProf.username}')">
+          <div class="ig-post-user" style="min-width:0; flex:1;" onclick="openUserProfile('${activeProf.username}')">
             <img class="ig-user-avatar" src="${activeProf.avatar}" alt="${activeProf.username}" onerror="handleImgError(this)" />
-            <div>
+            <div style="min-width:0; flex:1;">
               <div class="ig-username clickable-user">${activeProf.username}</div>
-              <div class="ig-post-sub">${activeProf.fullName} · ${activeProf.location[state.lang]}</div>
+              <div class="dm-thread-preview" style="font-size:0.74rem;">${activeProf.fullName} · ${activeProf.location[state.lang]}</div>
             </div>
           </div>
-          <button class="btn-outline" style="padding:0.4rem 0.75rem; font-size:0.76rem;" onclick="openUserProfile('${activeProf.username}')">
+          <button class="btn-outline" style="padding:0.38rem 0.7rem; font-size:0.75rem; flex-shrink:0;" onclick="openUserProfile('${activeProf.username}')">
             👤 ${isTr ? 'Profile Git' : 'View Profile'}
           </button>
         </div>
@@ -1902,15 +2395,15 @@ function renderMessagesView() {
         <div id="dm-messages-scroll" class="dm-messages-list">
           ${
             messages.length === 0
-              ? `<p style="text-align:center; color:var(--text-muted); font-size:0.84rem; margin-top:2rem;">
-                  ${isTr ? `@${activeProf.username} ile sohbete başla.` : `Start chatting with @${activeProf.username}.`}
+              ? `<p class="dm-empty-hint" style="text-align:center; color:var(--text-muted); font-size:0.84rem; margin:auto 0;">
+                  ${isTr ? `👋 @${activeProf.username} ile sohbete başla.` : `👋 Start chatting with @${activeProf.username}.`}
                 </p>`
               : messages
                   .map(
                     (m) => `
                   <div class="dm-bubble ${m.from === 'kaan.doc' ? 'mine' : 'theirs'}">
                     <div>${m.text[state.lang]}</div>
-                    <div style="font-size:0.65rem; opacity:0.75; margin-top:2px; text-align:right;">${m.time}</div>
+                    <div style="font-size:0.65rem; opacity:0.75; margin-top:3px; text-align:right;">${m.time}</div>
                   </div>
                 `
                   )
@@ -1921,12 +2414,13 @@ function renderMessagesView() {
         <div class="dm-input-bar">
           <input
             id="dm-message-input"
-            class="ig-comment-input"
+            class="dm-text-field"
             type="text"
+            autocomplete="off"
             placeholder="${isTr ? `@${activeProf.username} kullanıcısına mesaj yaz...` : `Message @${activeProf.username}...`}"
-            onkeydown="if(event.key==='Enter') sendDirectMessage()"
+            onkeydown="if(event.key==='Enter'){ event.preventDefault(); sendDirectMessage(); }"
           />
-          <button class="btn-primary" style="padding:0.5rem 0.95rem;" onclick="sendDirectMessage()">
+          <button class="btn-primary" style="padding:0.52rem 1rem; border-radius:999px; flex-shrink:0;" onclick="sendDirectMessage()">
             ${isTr ? 'Gönder' : 'Send'}
           </button>
         </div>
@@ -2023,6 +2517,9 @@ function renderProfileView() {
               <button class="btn-outline" onclick="openEditProfileModal()">
                 ✏️ ${isTr ? 'Profili Düzenle' : 'Edit Profile'}
               </button>
+              <button class="btn-outline" onclick="openCloudSyncModal()">
+                ☁️ ${isTr ? 'GitHub Eşitle' : 'GitHub Sync'}
+              </button>
             `
                 : `
               <button class="profile-follow-btn ${profileData.isFollowedByMe ? 'following' : ''}" onclick="toggleFollowUser('${profileData.username}')">
@@ -2105,8 +2602,9 @@ function renderModal() {
 
   const isTr = state.lang === 'tr';
 
-  // 1. Clean Photo/Video Upload Modal with <10% AI Threshold & Simulation Switch
+  // 1. Clean Photo/Video Upload Modal with <10% AI Threshold & Cloud Sync Info
   if (state.modal.type === 'create') {
+    const isCloudConnected = Boolean(state.ghRepo && state.ghToken);
     modalRoot.innerHTML = `
       <div class="modal-overlay" onclick="closeModal()">
         <div class="modal-card" onclick="event.stopPropagation()">
@@ -2115,7 +2613,26 @@ function renderModal() {
             <button class="ig-icon-btn" style="font-size:1.1rem;" onclick="closeModal()">✕</button>
           </div>
           <div class="modal-body">
-            <p style="font-size:0.82rem; color:var(--text-muted); margin-bottom:0.85rem;">
+            <!-- Cloud Sync Status Banner -->
+            <div class="cloud-sync-bar">
+              <span>
+                <span class="cloud-dot ${isCloudConnected ? 'online' : 'local'}"></span>
+                ${
+                  isCloudConnected
+                    ? isTr
+                      ? `<strong>GitHub Bulut Aktif:</strong> (${state.ghRepo}) Tüm cihazlarda görünür`
+                      : `<strong>GitHub Cloud Active:</strong> (${state.ghRepo}) Visible on all devices`
+                    : isTr
+                    ? 'Diğer cihazlarda da görünmesi için GitHub deponu bağla:'
+                    : 'Connect your GitHub repo so uploads appear on all devices:'
+                }
+              </span>
+              <button class="edit-post-btn" onclick="openCloudSyncModal()">
+                ☁️ ${isTr ? 'Ayarla' : 'Configure'}
+              </button>
+            </div>
+
+            <p style="font-size:0.81rem; color:var(--text-muted); margin-bottom:0.8rem;">
               ${tr('createModal.sub')}
             </p>
 
@@ -2125,7 +2642,7 @@ function renderModal() {
               <div class="upload-preview-stage">
                 ${
                   state.uploadedMainMedia.mediaType === 'video'
-                    ? `<video src="${state.uploadedMainMedia.url}" controls autoplay playsinline style="width:100%; max-height:300px; object-fit:contain;"></video>`
+                    ? `<video src="${state.uploadedMainMedia.url}" controls autoplay playsinline style="width:100%; max-height:280px; object-fit:contain;"></video>`
                     : `<img src="${state.uploadedMainMedia.url}" alt="Preview" />`
                 }
               </div>
@@ -2200,18 +2717,24 @@ function renderModal() {
                 : ''
             }
 
-            <div style="margin-bottom:0.8rem;">
-              <label style="font-size:0.8rem; font-weight:700; display:block; margin-bottom:0.3rem;">${tr('createModal.captionLabel')}</label>
-              <textarea id="create-caption-input" style="width:100%; min-height:64px; padding:0.6rem; border-radius:8px; border:1px solid var(--border); background:var(--bg-body); color:var(--text-main); font-family:inherit;" placeholder="Açıklama yaz...">${state.captionDraft}</textarea>
+            <div style="margin-bottom:0.75rem;">
+              <label style="font-size:0.8rem; font-weight:700; display:block; margin-bottom:0.25rem;">${tr('createModal.captionLabel')}</label>
+              <textarea id="create-caption-input" style="width:100%; min-height:60px; padding:0.58rem; border-radius:8px; border:1px solid var(--border); background:var(--bg-body); color:var(--text-main); font-family:inherit;" placeholder="Açıklama yaz...">${state.captionDraft}</textarea>
             </div>
 
-            <div style="margin-bottom:1rem;">
-              <label style="font-size:0.8rem; font-weight:700; display:block; margin-bottom:0.3rem;">${tr('createModal.themeLabel')}</label>
-              <select id="create-theme-select" style="width:100%; padding:0.52rem; border-radius:8px; border:1px solid var(--border); background:var(--bg-body); color:var(--text-main);">
-                <option value="#photography" ${state.themeDraft === '#photography' ? 'selected' : ''}>#photography</option>
-                <option value="#handmade" ${state.themeDraft === '#handmade' ? 'selected' : ''}>#handmade</option>
-                <option value="#art" ${state.themeDraft === '#art' ? 'selected' : ''}>#art</option>
-              </select>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:0.65rem; margin-bottom:0.95rem;">
+              <div>
+                <label style="font-size:0.8rem; font-weight:700; display:block; margin-bottom:0.25rem;">${tr('createModal.themeLabel')}</label>
+                <select id="create-theme-select" style="width:100%; padding:0.52rem; border-radius:8px; border:1px solid var(--border); background:var(--bg-body); color:var(--text-main);">
+                  <option value="#photography" ${state.themeDraft === '#photography' ? 'selected' : ''}>#photography</option>
+                  <option value="#handmade" ${state.themeDraft === '#handmade' ? 'selected' : ''}>#handmade</option>
+                  <option value="#art" ${state.themeDraft === '#art' ? 'selected' : ''}>#art</option>
+                </select>
+              </div>
+              <div>
+                <label style="font-size:0.8rem; font-weight:700; display:block; margin-bottom:0.25rem;">${tr('createModal.locationLabel')}</label>
+                <input id="create-location-input" type="text" value="${state.locationDraft}" style="width:100%; padding:0.5rem; border-radius:8px; border:1px solid var(--border); background:var(--bg-body); color:var(--text-main); font-family:inherit;" />
+              </div>
             </div>
 
             <button class="btn-primary" style="width:100%;" onclick="scanAndPublishPost()">
@@ -2224,7 +2747,156 @@ function renderModal() {
     return;
   }
 
-  // 2. Post Detail & AI Badge Report Modal
+  // 2. Edit Uploaded Post Modal (Caption, Tag, Location, Camera, Replace Media)
+  if (state.modal.type === 'editPost' && state.editPostDraft) {
+    const post = posts.find((p) => p.id === state.editPostDraft.postId);
+    if (!post) {
+      closeModal();
+      return;
+    }
+    const previewMediaUrl = state.editPostDraft.newMedia ? state.editPostDraft.newMedia.url : post.mediaUrl;
+    const previewMediaType = state.editPostDraft.newMedia ? state.editPostDraft.newMedia.mediaType : post.mediaType;
+
+    modalRoot.innerHTML = `
+      <div class="modal-overlay" onclick="closeModal()">
+        <div class="modal-card" style="max-width:500px;" onclick="event.stopPropagation()">
+          <div class="modal-top">
+            <span>✏️ ${tr('editPostModal.title')}</span>
+            <button class="ig-icon-btn" style="font-size:1.1rem;" onclick="closeModal()">✕</button>
+          </div>
+          <div class="modal-body">
+            <div class="upload-preview-stage" style="max-height:240px; margin-bottom:0.65rem;">
+              ${
+                previewMediaType === 'video'
+                  ? `<video src="${previewMediaUrl}" controls playsinline style="width:100%; max-height:240px; object-fit:contain;"></video>`
+                  : `<img src="${previewMediaUrl}" alt="Post preview" style="width:100%; max-height:240px; object-fit:cover;" />`
+              }
+            </div>
+
+            <label class="btn-outline" style="display:block; text-align:center; margin-bottom:0.9rem; cursor:pointer;">
+              ${tr('editPostModal.changeMedia')}
+              <input type="file" accept="image/*,video/*" style="display:none;" onchange="handleEditPostMediaInput(event)" />
+            </label>
+
+            <div style="margin-bottom:0.8rem;">
+              <label style="font-size:0.8rem; font-weight:700; display:block; margin-bottom:0.25rem;">${tr('editPostModal.captionLabel')}</label>
+              <textarea id="edit-post-caption" style="width:100%; min-height:70px; padding:0.6rem; border-radius:8px; border:1px solid var(--border); background:var(--bg-body); color:var(--text-main); font-family:inherit;">${state.editPostDraft.caption}</textarea>
+            </div>
+
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:0.65rem; margin-bottom:0.8rem;">
+              <div>
+                <label style="font-size:0.8rem; font-weight:700; display:block; margin-bottom:0.25rem;">${tr('editPostModal.themeLabel')}</label>
+                <input id="edit-post-theme" type="text" list="theme-suggestions" value="${state.editPostDraft.theme}" style="width:100%; padding:0.55rem; border-radius:8px; border:1px solid var(--border); background:var(--bg-body); color:var(--text-main); font-family:inherit;" />
+                <datalist id="theme-suggestions">
+                  <option value="#photography"></option>
+                  <option value="#handmade"></option>
+                  <option value="#art"></option>
+                </datalist>
+              </div>
+              <div>
+                <label style="font-size:0.8rem; font-weight:700; display:block; margin-bottom:0.25rem;">${tr('editPostModal.locationLabel')}</label>
+                <input id="edit-post-location" type="text" value="${state.editPostDraft.location}" style="width:100%; padding:0.55rem; border-radius:8px; border:1px solid var(--border); background:var(--bg-body); color:var(--text-main); font-family:inherit;" />
+              </div>
+            </div>
+
+            <div style="margin-bottom:1.1rem;">
+              <label style="font-size:0.8rem; font-weight:700; display:block; margin-bottom:0.25rem;">${tr('editPostModal.cameraLabel')}</label>
+              <input id="edit-post-camera" type="text" value="${state.editPostDraft.camera}" style="width:100%; padding:0.55rem; border-radius:8px; border:1px solid var(--border); background:var(--bg-body); color:var(--text-main); font-family:inherit;" />
+            </div>
+
+            <button class="btn-primary" style="width:100%;" onclick="saveEditedPost()">
+              ${tr('editPostModal.saveBtn')}
+            </button>
+          </div>
+        </div>
+      </div>
+    `;
+    return;
+  }
+
+  // 3. GitHub Cloud Database Sync Modal
+  if (state.modal.type === 'cloudSync') {
+    modalRoot.innerHTML = `
+      <div class="modal-overlay" onclick="closeModal()">
+        <div class="modal-card" style="max-width:500px;" onclick="event.stopPropagation()">
+          <div class="modal-top">
+            <span>☁️ ${isTr ? 'GitHub Bulut Veritabanı & Cihazlar Arası Eşitleme' : 'GitHub Cloud Database & Cross-Device Sync'}</span>
+            <button class="ig-icon-btn" style="font-size:1.1rem;" onclick="closeModal()">✕</button>
+          </div>
+          <div class="modal-body">
+            <p style="font-size:0.82rem; color:var(--text-muted); line-height:1.48; margin-bottom:0.9rem;">
+              ${
+                isTr
+                  ? 'Yüklediğin fotoğraf ve videoların sadece senin bilgisayarında değil, <strong>GitHub linkine giren tüm telefon ve bilgisayarlarda</strong> görünmesi için GitHub deponu buraya bağla. Yüklediğin medya dosyaları otomatik olarak depondaki <code>uploads/</code> klasörüne ve <code>shared-posts.json</code> dosyasına kaydedilir.'
+                  : 'Connect your GitHub repository so photos and videos you upload appear on <strong>every phone and computer</strong> visiting your GitHub link. Media files are automatically committed to <code>uploads/</code> and <code>shared-posts.json</code>.'
+              }
+            </p>
+
+            <div style="margin-bottom:0.8rem;">
+              <label style="font-size:0.8rem; font-weight:700; display:block; margin-bottom:0.25rem;">
+                ${isTr ? 'GitHub Depo Adı (kullaniciadi/repo-adi)' : 'GitHub Repository (username/repo-name)'}
+              </label>
+              <input
+                id="gh-repo-input"
+                type="text"
+                placeholder="Örn: kaan/WithoutAI"
+                value="${state.ghRepo}"
+                style="width:100%; padding:0.6rem; border-radius:8px; border:1px solid var(--border); background:var(--bg-body); color:var(--text-main); font-family:inherit;"
+              />
+            </div>
+
+            <div style="margin-bottom:0.8rem;">
+              <label style="font-size:0.8rem; font-weight:700; display:block; margin-bottom:0.25rem;">
+                ${isTr ? 'Dal (Branch)' : 'Branch'}
+              </label>
+              <input
+                id="gh-branch-input"
+                type="text"
+                placeholder="main"
+                value="${state.ghBranch}"
+                style="width:100%; padding:0.6rem; border-radius:8px; border:1px solid var(--border); background:var(--bg-body); color:var(--text-main); font-family:inherit;"
+              />
+            </div>
+
+            <div style="margin-bottom:1rem;">
+              <label style="font-size:0.8rem; font-weight:700; display:block; margin-bottom:0.25rem;">
+                ${isTr ? 'GitHub Personal Access Token (Yazma İzinli Token)' : 'GitHub Personal Access Token (with repo/contents write permission)'}
+              </label>
+              <input
+                id="gh-token-input"
+                type="password"
+                placeholder="ghp_xxxxxxxxxxxxxxxxxxxx"
+                value="${state.ghToken}"
+                style="width:100%; padding:0.6rem; border-radius:8px; border:1px solid var(--border); background:var(--bg-body); color:var(--text-main); font-family:inherit;"
+              />
+              <span style="font-size:0.72rem; color:var(--text-muted); display:block; margin-top:0.3rem;">
+                ${
+                  isTr
+                    ? '💡 GitHub -> Settings -> Developer settings -> Personal access tokens (Classic) -> Generate new token ("repo" kutucuğunu işaretle).'
+                    : '💡 GitHub -> Settings -> Developer settings -> Personal access tokens (Classic) -> Generate new token (check "repo" scope).'
+                }
+              </span>
+            </div>
+
+            <button class="btn-primary" style="width:100%;" onclick="saveCloudSyncSettings()">
+              ${
+                state.syncInProgress
+                  ? isTr
+                    ? '⏳ GitHub Depona Yükleniyor...'
+                    : '⏳ Uploading to GitHub Repo...'
+                  : isTr
+                  ? '☁️ Kaydet ve Yüklediğim Gönderileri GitHub’a Eşitle'
+                  : '☁️ Save & Sync My Uploaded Posts to GitHub'
+              }
+            </button>
+          </div>
+        </div>
+      </div>
+    `;
+    return;
+  }
+
+  // 4. Post Detail & AI Badge Report Modal
   if (state.modal.type === 'report') {
     const post = posts.find((p) => p.id === state.modal.postId) || posts[0];
     if (!post) {
@@ -2252,7 +2924,6 @@ function renderModal() {
               <span class="ai-score-pill ${post.badgeType}">${post.badgeLabel[state.lang]}</span>
             </div>
 
-            <!-- Post Media Preview inside Modal -->
             <div class="upload-preview-stage" style="max-height:310px; margin-bottom:0.65rem;">
               ${
                 post.mediaType === 'video'
@@ -2298,12 +2969,19 @@ function renderModal() {
               <strong>${tr('reportModal.fsekVal')}</strong>
             </div>
 
-            <div style="display:flex; justify-content:space-between; align-items:center; gap:0.6rem; margin-top:1.15rem; flex-wrap:wrap;">
+            <div style="display:flex; justify-content:space-between; align-items:center; gap:0.5rem; margin-top:1.15rem; flex-wrap:wrap;">
               ${
                 isMyPost
-                  ? `<button class="delete-post-btn" style="padding:0.55rem 0.95rem; font-size:0.82rem;" onclick="deletePost('${post.id}')">
+                  ? `
+                  <div style="display:flex; gap:0.5rem;">
+                    <button class="edit-post-btn" style="padding:0.55rem 0.9rem; font-size:0.82rem;" onclick="openEditPostModal('${post.id}')">
+                      ${tr('reportModal.editPost')}
+                    </button>
+                    <button class="delete-post-btn" style="padding:0.55rem 0.9rem; font-size:0.82rem;" onclick="deletePost('${post.id}')">
                       ${tr('reportModal.deletePost')}
-                    </button>`
+                    </button>
+                  </div>
+                `
                   : `<button class="btn-outline" onclick="openUserProfile('${post.username}')">
                       ${tr('reportModal.viewProfile')} (@${post.username})
                     </button>`
@@ -2317,7 +2995,7 @@ function renderModal() {
     return;
   }
 
-  // 3. Edit Profile Modal (for kaan.doc)
+  // 5. Edit Profile Modal
   if (state.modal.type === 'editProfile') {
     const me = USER_PROFILES['kaan.doc'];
     modalRoot.innerHTML = `
@@ -2361,7 +3039,7 @@ function renderModal() {
     return;
   }
 
-  // 4. Followers / Following List Modal
+  // 6. Followers / Following List Modal
   if (state.modal.type === 'followers') {
     const isFollowers = state.modal.listType === 'followers';
     const allCreators = Object.values(USER_PROFILES).filter((u) => u.username !== state.modal.username);
@@ -2402,7 +3080,7 @@ function renderModal() {
     return;
   }
 
-  // 5. Story Viewer Modal
+  // 7. Story Viewer Modal
   if (state.modal.type === 'story') {
     const st = stories.find((s) => s.id === state.modal.storyId) || stories[0];
     if (!st) {
@@ -2449,6 +3127,7 @@ function renderNavigation() {
   const sidebar = document.getElementById('sidebar-root');
   const bottomnav = document.getElementById('bottomnav-root');
   const isMyProfileActive = state.page === 'profile' && state.profileUser === 'kaan.doc';
+  const isCloudConnected = Boolean(state.ghRepo && state.ghToken);
 
   if (topbar) {
     topbar.innerHTML = `
@@ -2456,6 +3135,9 @@ function renderNavigation() {
         WithoutAI<span class="ig-logo-dot">.</span>
       </div>
       <div class="mobile-top-actions">
+        <button class="mobile-pill-btn" onclick="openCloudSyncModal()">
+          <span class="cloud-dot ${isCloudConnected ? 'online' : 'local'}"></span>☁️
+        </button>
         <button class="mobile-pill-btn" onclick="setLang('${state.lang === 'tr' ? 'en' : 'tr'}')">
           ${state.lang === 'tr' ? '🇹🇷 TR' : '🇬🇧 EN'}
         </button>
@@ -2494,6 +3176,10 @@ function renderNavigation() {
           <button class="ig-nav-item ${isMyProfileActive ? 'active' : ''}" onclick="setPage('profile')">
             <span class="ig-nav-icon">👤</span>
             <span>${tr('nav.profile')}</span>
+          </button>
+          <button class="ig-nav-item" onclick="openCloudSyncModal()">
+            <span class="ig-nav-icon">☁️</span>
+            <span>${tr('nav.cloudSync')} <span class="cloud-dot ${isCloudConnected ? 'online' : 'local'}"></span></span>
           </button>
           <button class="ig-nav-item ig-nav-create" onclick="openCreateModal()">
             <span class="ig-nav-icon">➕</span>
@@ -2568,12 +3254,26 @@ function renderAll() {
 window.addEventListener('DOMContentLoaded', async () => {
   document.documentElement.setAttribute('data-theme', state.theme);
   document.documentElement.lang = state.lang;
-  const savedUserPosts = await loadUserPostsFromDB();
-  if (savedUserPosts && savedUserPosts.length > 0) {
-    savedUserPosts.sort((a, b) => b.timestamp - a.timestamp);
-    posts = [...savedUserPosts, ...defaultPosts];
-  } else {
-    posts = [...defaultPosts];
+
+  // 1. Load local IndexedDB posts
+  const localPosts = await loadUserPostsFromDB();
+  // 2. Load shared cloud posts from GitHub (so other phones/PCs see uploaded videos & photos!)
+  const cloudPosts = await loadSharedPostsFromCloud();
+
+  // Merge cloud posts + local posts + defaultPosts without duplicates
+  const mergedMap = new Map();
+  for (const cp of cloudPosts) {
+    cp.avatar = AVATARS.kaan;
+    mergedMap.set(cp.id, cp);
   }
+  for (const lp of localPosts) {
+    lp.avatar = AVATARS.kaan;
+    mergedMap.set(lp.id, lp);
+  }
+
+  const userPostList = Array.from(mergedMap.values()).sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+  const remainingDefault = defaultPosts.filter((dp) => !mergedMap.has(dp.id));
+
+  posts = [...userPostList, ...remainingDefault];
   renderAll();
 });
