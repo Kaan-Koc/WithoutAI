@@ -1,104 +1,107 @@
-[
-  {
-    "id": "p-1794670056485",
-    "feedCategory": "following",
-    "username": "kaan.doc",
-    "fullName": "Kaan",
-    "isFounding": true,
-    "location": {
-      "tr": "İstanbul",
-      "en": "İstanbul"
+{
+  "posts": [
+    {
+      "id": "p-1794670056485",
+      "feedCategory": "following",
+      "username": "kaan.doc",
+      "fullName": "Kaan",
+      "isFounding": true,
+      "location": {
+        "tr": "İstanbul",
+        "en": "Istanbul"
+      },
+      "timeAgo": {
+        "tr": "YENİ",
+        "en": "NEW"
+      },
+      "timestamp": 1794670056485,
+      "theme": "#photography",
+      "score": 2,
+      "badgeType": "low",
+      "badgeLabel": {
+        "tr": "AI-filtered · %2",
+        "en": "AI-filtered · 2%"
+      },
+      "camera": "C2PA Verified Media",
+      "likes": 1,
+      "mediaType": "video",
+      "mediaUrl": "https://raw.githubusercontent.com/Kaan-Koc/WithoutAI/main/uploads/p-1794670056485.mp4",
+      "remoteMediaUrl": "https://raw.githubusercontent.com/Kaan-Koc/WithoutAI/main/uploads/p-1794670056485.mp4",
+      "caption": {
+        "tr": "Yeni paylaşım.",
+        "en": "New post."
+      },
+      "comments": [],
+      "isEdited": false
     },
-    "timeAgo": {
-      "tr": "ŞİMDİ",
-      "en": "JUST NOW"
+    {
+      "id": "p-1794670030711",
+      "feedCategory": "following",
+      "username": "kaan.doc",
+      "fullName": "Kaan",
+      "isFounding": true,
+      "location": {
+        "tr": "İstanbul",
+        "en": "Istanbul"
+      },
+      "timeAgo": {
+        "tr": "YENİ",
+        "en": "NEW"
+      },
+      "timestamp": 1794670030711,
+      "theme": "#photography",
+      "score": 2,
+      "badgeType": "low",
+      "badgeLabel": {
+        "tr": "AI-filtered · %2",
+        "en": "AI-filtered · 2%"
+      },
+      "camera": "C2PA Verified Media",
+      "likes": 1,
+      "mediaType": "video",
+      "mediaUrl": "https://raw.githubusercontent.com/Kaan-Koc/WithoutAI/main/uploads/p-1794670030711.mp4",
+      "remoteMediaUrl": "https://raw.githubusercontent.com/Kaan-Koc/WithoutAI/main/uploads/p-1794670030711.mp4",
+      "caption": {
+        "tr": "Yeni paylaşım.",
+        "en": "New post."
+      },
+      "comments": [],
+      "isEdited": false
     },
-    "timestamp": 1794670056485,
-    "theme": "#handmade",
-    "score": 2,
-    "badgeType": "low",
-    "badgeLabel": {
-      "tr": "AI-filtered · %2",
-      "en": "AI-filtered · 2%"
-    },
-    "camera": "C2PA Verified Media",
-    "likes": 1,
-    "mediaType": "video",
-    "mediaUrl": "https://raw.githubusercontent.com/Kaan-Koc/WithoutAI/main/uploads/p-1794670056485.mp4",
-    "remoteMediaUrl": "https://raw.githubusercontent.com/Kaan-Koc/WithoutAI/main/uploads/p-1794670056485.mp4",
-    "caption": {
-      "tr": "Tired of AI?",
-      "en": "Tired of AI?"
-    },
-    "comments": [],
-    "isEdited": false
-  },
-  {
-    "id": "p-1794670030711",
-    "feedCategory": "following",
-    "username": "kaan.doc",
-    "fullName": "Kaan",
-    "isFounding": true,
-    "location": {
-      "tr": "İstanbul",
-      "en": "İstanbul"
-    },
-    "timeAgo": {
-      "tr": "ŞİMDİ",
-      "en": "JUST NOW"
-    },
-    "timestamp": 1794670030711,
-    "theme": "#handmade",
-    "score": 2,
-    "badgeType": "low",
-    "badgeLabel": {
-      "tr": "AI-filtered · %2",
-      "en": "AI-filtered · 2%"
-    },
-    "camera": "C2PA Verified Media",
-    "likes": 1,
-    "mediaType": "video",
-    "mediaUrl": "https://raw.githubusercontent.com/Kaan-Koc/WithoutAI/main/uploads/p-1794670030711.mp4",
-    "remoteMediaUrl": "https://raw.githubusercontent.com/Kaan-Koc/WithoutAI/main/uploads/p-1794670030711.mp4",
-    "caption": {
-      "tr": "Başka Agayla Parkur",
-      "en": "Başka Agayla Parkur"
-    },
-    "comments": [],
-    "isEdited": false
-  },
-  {
-    "id": "p-1794669997451",
-    "feedCategory": "following",
-    "username": "kaan.doc",
-    "fullName": "Kaan",
-    "isFounding": true,
-    "location": {
-      "tr": "İstanbul",
-      "en": "İstanbul"
-    },
-    "timeAgo": {
-      "tr": "ŞİMDİ",
-      "en": "JUST NOW"
-    },
-    "timestamp": 1794669997451,
-    "theme": "#handmade",
-    "score": 2,
-    "badgeType": "low",
-    "badgeLabel": {
-      "tr": "AI-filtered · %2",
-      "en": "AI-filtered · 2%"
-    },
-    "camera": "C2PA Verified Media",
-    "likes": 1,
-    "mediaType": "video",
-    "mediaUrl": "https://raw.githubusercontent.com/Kaan-Koc/WithoutAI/main/uploads/p-1794669997451.mp4",
-    "remoteMediaUrl": "https://raw.githubusercontent.com/Kaan-Koc/WithoutAI/main/uploads/p-1794669997451.mp4",
-    "caption": {
-      "tr": "Agayla Parkur",
-      "en": "Agayla Parkur"
-    },
-    "comments": [],
-    "isEdited": false
-  }
-]
+    {
+      "id": "p-1794669997451",
+      "feedCategory": "following",
+      "username": "kaan.doc",
+      "fullName": "Kaan",
+      "isFounding": true,
+      "location": {
+        "tr": "İstanbul",
+        "en": "Istanbul"
+      },
+      "timeAgo": {
+        "tr": "YENİ",
+        "en": "NEW"
+      },
+      "timestamp": 1794669997451,
+      "theme": "#photography",
+      "score": 2,
+      "badgeType": "low",
+      "badgeLabel": {
+        "tr": "AI-filtered · %2",
+        "en": "AI-filtered · 2%"
+      },
+      "camera": "C2PA Verified Media",
+      "likes": 1,
+      "mediaType": "video",
+      "mediaUrl": "https://raw.githubusercontent.com/Kaan-Koc/WithoutAI/main/uploads/p-1794669997451.mp4",
+      "remoteMediaUrl": "https://raw.githubusercontent.com/Kaan-Koc/WithoutAI/main/uploads/p-1794669997451.mp4",
+      "caption": {
+        "tr": "Yeni paylaşım.",
+        "en": "New post."
+      },
+      "comments": [],
+      "isEdited": false
+    }
+  ],
+  "deletedIds": []
+}
